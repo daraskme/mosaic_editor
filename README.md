@@ -25,6 +25,10 @@ PythonとTkinterで作られた画像モザイク編集ツールです。
 
 付属のスクリプトを使用すると、仮想環境(venv)の作成から依存ライブラリのインストール、実行までを自動で行えます。
 
+**Windows**:
+`mosaic.bat` をダブルクリックするか、フォルダや画像をドラッグ＆ドロップして起動できます。
+
+**Linux / Mac**:
 ```bash
 chmod +x mosaic.sh
 ./mosaic.sh
@@ -32,6 +36,20 @@ chmod +x mosaic.sh
 
 ### 手動セットアップ
 
+**Windows**:
+```cmd
+:: 仮想環境の作成
+python -m venv venv
+venv\Scripts\activate
+
+:: 依存関係のインストール
+pip install -r requirements.txt
+
+:: アプリケーションの実行
+python mosaic.py
+```
+
+**Linux / Mac**:
 ```bash
 # 仮想環境の作成
 python3 -m venv venv
