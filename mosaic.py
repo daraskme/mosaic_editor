@@ -33,6 +33,7 @@ class MosaicEditor:
         # Trace mosaic size to update view on change
         self.mosaic_size.trace_add("write", self.on_mosaic_size_change)
         self.show_mask = tk.BooleanVar(value=True) # Default to showing mask as requested "displayed in green"
+        self.use_edge_detection = tk.BooleanVar(value=False) # New: Stop at edges
 
         self.undo_stack: List[np.ndarray] = []
         self.redo_stack: List[np.ndarray] = []
@@ -160,6 +161,9 @@ class MosaicEditor:
         # Show Mask Toggle
         tk.Checkbutton(sliders_frame, text="範囲表示", variable=self.show_mask, 
                        command=self.update_view).grid(row=0, column=6, sticky="w", padx=4)
+
+        # Edge Detection Toggle
+        tk.Checkbutton(sliders_frame, text="境界線で止める", variable=self.use_edge_detection).grid(row=0, column=7, sticky="w", padx=4)
 
         # Canvas already initialized in __init__
         if self.canvas is not None:
@@ -306,8 +310,31 @@ class MosaicEditor:
         connectivity = 8
         flags = connectivity | (255 << 8) | cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE
         
-        cv2.floodFill(img_bgr, mask, (x, y), (255, 255, 255), 
-                      (tol, tol, tol), (tol, tol, tol), flags)
+        # If edge detection is enabled, apply it
+        if self.use_edge_detection.get():
+            # Create gray image for Canny
+            gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+            # Use fixed thresholds for now, or could add slider later
+            # 100, 200 is a standard starting point
+            edges = cv2.Canny(gray, 100, 200)
+            
+            # Dilate edges slightly to close gaps (make lines "thicker" barrier)
+            kernel_edge = np.ones((3,3), np.uint8)
+            edges_dilated = cv2.dilate(edges, kernel_edge, iterations=1)
+            
+            # Embed edges into the mask
+            # mask is (h+2, w+2), edges is (h, w)
+            # Place edges into mask at [1:-1, 1:-1]
+            mask[1:-1, 1:-1][edges_dilated > 0] = 255  # Mark as visited/barrier
+            
+            # Ensure seed point is not blocked (otherwise floodfill fails immediately)
+            if mask[y+1, x+1] == 0:
+                 cv2.floodFill(img_bgr, mask, (x, y), (255, 255, 255), 
+                               (tol, tol, tol), (tol, tol, tol), flags)
+        else:
+             # Standard floodfill
+             cv2.floodFill(img_bgr, mask, (x, y), (255, 255, 255), 
+                           (tol, tol, tol), (tol, tol, tol), flags)
         
         # Extract the relevant part of the mask
         flood_mask = mask[1:-1, 1:-1]
