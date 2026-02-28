@@ -45,6 +45,11 @@ class MosaicEditor:
         
         # Cursor preview tag
         self.cursor_tag = "cursor_preview"
+        self.preview_rect_tag = "preview_rect"
+        self.selection_tag = "selection_rect"
+        self.selection_rect: Optional[tuple] = None
+        self.rect_start_x = None
+        self.rect_start_y = None
 
         # Initialize canvas early to satisfy type checker (packed later in build_ui)
         self.canvas = tk.Canvas(self.root, cursor="crosshair", bg="gray")
@@ -134,10 +139,13 @@ class MosaicEditor:
         mode_frame.pack(side="left", padx=5)
 
         for text, val in [("ペン", "pen"),
+                          ("選択", "rect"),
                           ("魔法の杖", "wand"),
                           ("消しゴム", "eraser")]:
             tk.Radiobutton(mode_frame, text=text,
                            variable=self.mode, value=val).pack(side="left")
+        
+        tk.Button(mode_frame, text="解除", command=self.clear_selection).pack(side="left", padx=(5, 5))
 
         # Sliders
         sliders_frame = tk.Frame(settings_frame)
@@ -150,8 +158,7 @@ class MosaicEditor:
 
         # Brush Size
         tk.Label(sliders_frame, text="ブラシサイズ").grid(row=0, column=2, sticky="e")
-        tk.Spinbox(sliders_frame, from_=1, to=200, width=5,
-                   textvariable=self.brush_size).grid(row=0, column=3, sticky="w")
+        tk.Scale(sliders_frame, from_=1, to=200, variable=self.brush_size, orient=tk.HORIZONTAL, length=100).grid(row=0, column=3, sticky="w")
 
         # Mosaic Size
         tk.Label(sliders_frame, text="モザイク強度").grid(row=0, column=4, sticky="e")
@@ -186,6 +193,11 @@ class MosaicEditor:
         
         # Bind window close event for auto-save
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def clear_selection(self):
+        self.selection_rect = None
+        if hasattr(self, 'canvas') and self.canvas:
+            self.canvas.delete(self.selection_tag)
 
     def on_closing(self):
         self.save_current(show_dialog=False)
@@ -249,11 +261,12 @@ class MosaicEditor:
         if self.mode.get() == "eraser":
             color = "white"
         
-        # Draw circle
-        self.canvas.create_oval(
-            cx - r, cy - r, cx + r, cy + r,
-            outline=color, width=2, tags=self.cursor_tag
-        )
+        # Draw circle if applicable
+        if self.mode.get() not in ("rect", "wand"):
+            self.canvas.create_oval(
+                cx - r, cy - r, cx + r, cy + r,
+                outline=color, width=2, tags=self.cursor_tag
+            )
 
     def on_click(self, event):
         if self.image is None:
@@ -264,7 +277,10 @@ class MosaicEditor:
         if self.mode.get() == "wand":
             self.start_stroke() # Push history for undo
             self.apply_wand_flood(ix, iy)
+        elif self.mode.get() == "rect":
+            self.rect_start_x, self.rect_start_y = ix, iy
         else:
+            self.start_stroke()
             self.apply_brush(ix, iy)
 
     def on_drag(self, event):
@@ -280,10 +296,45 @@ class MosaicEditor:
             self.apply_brush(ix, iy)
         elif self.mode.get() == "wand":
              self.apply_wand_flood(ix, iy)
+        elif self.mode.get() == "rect":
+             if self.rect_start_x is not None and self.rect_start_y is not None:
+                 self.canvas.delete(self.preview_rect_tag)
+                 start_cx = self.rect_start_x * self.zoom
+                 start_cy = self.rect_start_y * self.zoom
+                 cx = self.canvas.canvasx(event.x)
+                 cy = self.canvas.canvasy(event.y)
+                 self.canvas.create_rectangle(
+                     start_cx, start_cy, cx, cy,
+                     outline="red", width=2, dash=(4, 4), tags=self.preview_rect_tag
+                 )
 
     def on_release(self, event):
-        # No specific action needed for pen/eraser as they apply instantly
-        pass
+        if self.mode.get() == "rect":
+            if self.rect_start_x is not None and self.rect_start_y is not None:
+                ix, iy = self.canvas_to_image(event.x, event.y)
+                x1, x2 = min(self.rect_start_x, ix), max(self.rect_start_x, ix)
+                y1, y2 = min(self.rect_start_y, iy), max(self.rect_start_y, iy)
+                
+                self.canvas.delete(self.preview_rect_tag)
+                
+                if abs(x2 - x1) < 2 and abs(y2 - y1) < 2:
+                    self.clear_selection()
+                else:
+                    h, w = self.mosaic_mask.shape[:2] if self.mosaic_mask is not None else (0, 0)
+                    if w > 0 and h > 0:
+                        x1 = max(0, min(w, x1))
+                        y1 = max(0, min(h, y1))
+                        x2 = max(0, min(w, x2))
+                        y2 = max(0, min(h, y2))
+                        self.selection_rect = (x1, y1, x2, y2)
+                        self.canvas.delete(self.selection_tag)
+                        self.canvas.create_rectangle(
+                            x1 * self.zoom, y1 * self.zoom, x2 * self.zoom, y2 * self.zoom,
+                            outline="red", width=2, dash=(4, 4), tags=self.selection_tag
+                        )
+                
+                self.rect_start_x = None
+                self.rect_start_y = None
 
     # ================= Wand (Flood Fill) =================
 
@@ -349,6 +400,12 @@ class MosaicEditor:
         # Apply to mosaic_mask directly
         m_mask = self.mosaic_mask
         if m_mask is not None:
+             if hasattr(self, 'selection_rect') and self.selection_rect is not None:
+                 sx1, sy1, sx2, sy2 = self.selection_rect
+                 sel_mask = np.zeros_like(m_mask, dtype=bool)
+                 sel_mask[sy1:sy2, sx1:sx2] = True
+                 flood_mask_bool = flood_mask_bool & sel_mask
+                 
              m_mask[flood_mask_bool] = 255
         
         self.update_view()
@@ -368,8 +425,14 @@ class MosaicEditor:
         if self.mode.get() == "eraser":
              color = 0 # No Mosaic
 
-        # cv2.circle matches the visual appearance better than manual grid check
-        cv2.circle(m_mask, (x, y), r, (color,), -1)
+        if hasattr(self, 'selection_rect') and self.selection_rect is not None:
+            temp_mask = m_mask.copy()
+            cv2.circle(temp_mask, (x, y), r, (color,), -1)
+            sx1, sy1, sx2, sy2 = self.selection_rect
+            m_mask[sy1:sy2, sx1:sx2] = temp_mask[sy1:sy2, sx1:sx2]
+        else:
+            # cv2.circle matches the visual appearance better than manual grid check
+            cv2.circle(m_mask, (x, y), r, (color,), -1)
         
         self.update_view()
 
@@ -484,6 +547,8 @@ class MosaicEditor:
         
         # Clear Undo/Redo
         self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.clear_selection()
         
         self.update_view() # Generates self.image
         
@@ -528,6 +593,13 @@ class MosaicEditor:
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor="nw", image=self.tk_image)
         self.canvas.config(scrollregion=(0, 0, new_w, new_h))
+        
+        if hasattr(self, 'selection_rect') and self.selection_rect is not None:
+            x1, y1, x2, y2 = self.selection_rect
+            self.canvas.create_rectangle(
+                x1 * self.zoom, y1 * self.zoom, x2 * self.zoom, y2 * self.zoom,
+                outline="red", width=2, dash=(4, 4), tags=self.selection_tag
+            )
 
     def next_image(self):
         self.save_current(show_dialog=False)
