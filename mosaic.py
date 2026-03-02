@@ -9,6 +9,8 @@ import threading
 from typing import Optional, List
 
 SUPPORTED_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+SUPPORTED_VIDEO_EXT = (".mp4", ".avi", ".mov", ".mkv", ".webm")
+ALL_SUPPORTED_EXT = SUPPORTED_EXT + SUPPORTED_VIDEO_EXT
 
 
 class MosaicEditor:
@@ -25,12 +27,22 @@ class MosaicEditor:
         self.current_path: Optional[str] = None
         self.output_folder: Optional[str] = None
 
+        # ---- 動画状態 ----
+        self.is_video: bool = False
+        self.video_cap: Optional[cv2.VideoCapture] = None
+        self.video_total_frames: int = 0
+        self.video_fps: float = 30.0
+        self.video_frame_index: int = 0
+        self.video_masks: dict = {}  # {frame_idx: np.ndarray}
+        self.frame_label: Optional[tk.Label] = None
+
         # Mode: pen, wand, eraser, rect
         self.mode = tk.StringVar(value="pen")
         self.threshold = tk.IntVar(value=40)
         self.brush_size = tk.IntVar(value=20)
         self.mosaic_size = tk.IntVar(value=10)
         self.mosaic_size.trace_add("write", self.on_mosaic_size_change)
+        self.auto_mosaic = tk.BooleanVar(value=True)  # 規定準拠自動サイズ
         self.show_mask = tk.BooleanVar(value=True)
         self.use_edge_detection = tk.BooleanVar(value=False)
 
@@ -92,13 +104,13 @@ class MosaicEditor:
                 if os.path.isdir(p):
                     for root_dir, _, filenames in os.walk(p):
                         for f in filenames:
-                            if f.lower().endswith(SUPPORTED_EXT):
+                            if f.lower().endswith(ALL_SUPPORTED_EXT):
                                 all_files.append(os.path.join(root_dir, f))
-                elif os.path.isfile(p) and p.lower().endswith(SUPPORTED_EXT):
+                elif os.path.isfile(p) and p.lower().endswith(ALL_SUPPORTED_EXT):
                     all_files.append(p)
 
             if not all_files:
-                messagebox.showwarning("D&D", "対応画像ファイルが見つかりませんでした")
+                messagebox.showwarning("D&D", "対応ファイルが見つかりませんでした")
                 return
 
             all_files.sort()
@@ -114,7 +126,7 @@ class MosaicEditor:
             self.output_folder = out_folder
             self.image_list = all_files
             self.current_index = 0
-            self.load_current_image()
+            self.load_current_file()
         except Exception as e:
             messagebox.showerror("D&Dエラー", str(e))
 
@@ -129,9 +141,21 @@ class MosaicEditor:
 
     # ================= Utility =================
 
-    def get_block_size(self):
-        size = self.mosaic_size.get()
-        return max(2, size)
+    def get_block_size(self, img_w: int = 0, img_h: int = 0) -> int:
+        """ブロックサイズを取得。自動モード時は視親規定に基づく計算。
+
+        規定: 長辺が400px以上なら max(4, 長辺 // 100)、未満なら最小4px。
+        """
+        if self.auto_mosaic.get():
+            # 画像サイズが渡されていない場合は現在画像から取得
+            if img_w == 0 and img_h == 0 and self.original_image is not None:
+                img_w, img_h = self.original_image.size
+            long_side = max(img_w, img_h)
+            if long_side >= 400:
+                return max(4, long_side // 100)
+            return 4  # 長辺400px未満は最小4px
+        # 手動指定時は最小4pxを保証
+        return max(4, self.mosaic_size.get())
 
     def push_history(self):
         mask = self.mosaic_mask
@@ -165,6 +189,7 @@ class MosaicEditor:
         menubar = tk.Menu(self.root)
         filemenu = tk.Menu(menubar, tearoff=0)
         filemenu.add_command(label="画像を開く", command=self.open_image)
+        filemenu.add_command(label="動画を開く", command=self.open_video)
         filemenu.add_command(label="フォルダを開く", command=self.open_folder)
         filemenu.add_command(label="保存", command=self.save_current)
         menubar.add_cascade(label="ファイル", menu=filemenu)
@@ -186,11 +211,16 @@ class MosaicEditor:
         tk.Button(top, text="戻す", command=self.undo).pack(side="left", padx=5)
         tk.Button(top, text="やり直す", command=self.redo).pack(side="left")
 
-        tk.Button(top, text="＋", command=self.zoom_in).pack(side="left", padx=(10, 0))
-        tk.Button(top, text="−", command=self.zoom_out).pack(side="left")
+        tk.Button(top, text="拡大", command=self.zoom_in).pack(side="left", padx=(10, 0))
+        tk.Button(top, text="縮小", command=self.zoom_out).pack(side="left", padx=(2, 0))
+        tk.Button(top, text="100%", command=self.zoom_custom).pack(side="left", padx=(2, 0))
 
         tk.Button(top, text="自動検出 (YOLO)", command=self.auto_detect_yolo,
                   bg="#4a90d9", fg="white", relief="flat", padx=6).pack(side="left", padx=(10, 0))
+
+        # フレームナビラベル（動画時のみ使用）
+        self.frame_label = tk.Label(top, text="", font=("Consolas", 9), fg="#555")
+        self.frame_label.pack(side="right", padx=8)
 
         # Settings Area
         settings_frame = tk.Frame(self.root)
@@ -222,14 +252,28 @@ class MosaicEditor:
                  orient=tk.HORIZONTAL, length=100).grid(row=0, column=3, sticky="w")
 
         tk.Label(sliders_frame, text="モザイク強度").grid(row=0, column=4, sticky="e")
-        tk.Spinbox(sliders_frame, from_=2, to=100, width=5,
-                   textvariable=self.mosaic_size).grid(row=0, column=5, sticky="w")
+        self._mosaic_spinbox = tk.Spinbox(sliders_frame, from_=4, to=100, width=5,
+                   textvariable=self.mosaic_size)
+        self._mosaic_spinbox.grid(row=0, column=5, sticky="w")
+
+        def _on_auto_toggle(*_):
+            state = "disabled" if self.auto_mosaic.get() else "normal"
+            self._mosaic_spinbox.config(state=state)
+            self.update_view()
+
+        self.auto_mosaic.trace_add("write", _on_auto_toggle)
+        _auto_cb = tk.Checkbutton(sliders_frame, text="自動(規定)",
+                                  variable=self.auto_mosaic,
+                                  command=lambda: _on_auto_toggle())
+        _auto_cb.grid(row=0, column=6, sticky="w", padx=(2, 4))
+        # 初期状態を反映
+        _on_auto_toggle()
 
         tk.Checkbutton(sliders_frame, text="範囲表示", variable=self.show_mask,
-                       command=self.update_view).grid(row=0, column=6, sticky="w", padx=4)
+                       command=self.update_view).grid(row=0, column=7, sticky="w", padx=4)
 
         tk.Checkbutton(sliders_frame, text="境界線で止める", variable=self.use_edge_detection).grid(
-            row=0, column=7, sticky="w", padx=4)
+            row=0, column=8, sticky="w", padx=4)
 
         if self.canvas is not None:
             self.canvas.pack(fill="both", expand=True)
@@ -257,8 +301,12 @@ class MosaicEditor:
             self.canvas.delete(self.selection_tag)
 
     def on_closing(self):
+        if self.is_video and self.video_cap is not None:
+            self.video_cap.release()
+            self.video_cap = None
         self.save_current(show_dialog=False)
         self.root.destroy()
+
 
     def on_mosaic_size_change(self, *args):
         try:
@@ -272,14 +320,14 @@ class MosaicEditor:
     # ================= Zoom =================
 
     def on_mousewheel(self, event):
-        """Windowsマウスホイールイベント: マウス位置を中心に拡大縮小"""
-        if self.image is None:
-            return
-        if event.delta > 0:
-            factor = 1.1
+        """Windowsマウスホイール: 動画時はフレーム移動、画像時はズーム（Ctrl+ホイールは常にズーム）"""
+        ctrl = (event.state & 0x4) != 0
+        if self.is_video and not ctrl:
+            # フレーム移動: ホイール下 = 次フレーム、ホイール上 = 前フレーム
+            self._navigate_frame(1 if event.delta < 0 else -1)
         else:
-            factor = 1 / 1.1
-        self._zoom_at(event, factor)
+            factor = 1.1 if event.delta > 0 else 1 / 1.1
+            self._zoom_at(event, factor)
 
     def _zoom_at(self, event, factor):
         """マウスカーソル位置を中心にズーム"""
@@ -332,6 +380,38 @@ class MosaicEditor:
             return
         self.zoom /= 1.25
         self._display_image_preserving_pos()
+
+    def zoom_custom(self):
+        """ズーム率を数値入力ダイアログで設定"""
+        if self.image is None:
+            return
+        dlg = tk.Toplevel(self.root)
+        dlg.title("ズーム率を指定")
+        dlg.geometry("260x100")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="ズーム率 (%)を入力 (10〜2000)",
+                 font=("", 9)).pack(pady=(10, 4))
+        val = tk.IntVar(value=int(self.zoom * 100))
+        sb = tk.Spinbox(dlg, from_=10, to=2000, width=8, textvariable=val, font=("", 10))
+        sb.pack()
+        sb.focus_set()
+        sb.selection_range(0, "end")
+
+        def apply(event=None):
+            try:
+                v = int(val.get())
+                self.zoom = max(0.1, min(20.0, v / 100))
+                self._display_image_preserving_pos()
+            except (ValueError, tk.TclError):
+                pass
+            dlg.destroy()
+
+        sb.bind("<Return>", apply)
+        tk.Button(dlg, text="OK", command=apply,
+                  bg="#3a7bd5", fg="white", relief="flat",
+                  padx=12, pady=3).pack(pady=6)
 
     # ================= Pan =================
 
@@ -596,74 +676,166 @@ class MosaicEditor:
         )
         if not path:
             return
-
         self.image_list = [path]
         self.current_index = 0
         self.current_path = path
-
         out_folder = os.path.dirname(path) + "_mc"
         os.makedirs(out_folder, exist_ok=True)
         self.output_folder = out_folder
+        self.load_current_file()
 
-        self.load_current_image()
+    def open_video(self):
+        self.save_current(show_dialog=False)
+        path = filedialog.askopenfilename(
+            filetypes=[("Videos", "*.mp4 *.avi *.mov *.mkv *.webm"),
+                       ("All files", "*.*")]
+        )
+        if not path:
+            return
+        self.image_list = [path]
+        self.current_index = 0
+        self.current_path = path
+        out_folder = os.path.dirname(path) + "_mc"
+        os.makedirs(out_folder, exist_ok=True)
+        self.output_folder = out_folder
+        self.load_current_file()
 
     def open_folder(self):
         self.save_current(show_dialog=False)
         folder = filedialog.askdirectory()
         if not folder:
             return
-
         out_folder = folder + "_mc"
         os.makedirs(out_folder, exist_ok=True)
         self.output_folder = out_folder
-
         files = []
         for root_dir, _, filenames in os.walk(folder):
             for f in filenames:
-                if f.lower().endswith(SUPPORTED_EXT):
+                if f.lower().endswith(ALL_SUPPORTED_EXT):
                     files.append(os.path.join(root_dir, f))
-
         files.sort()
         self.image_list = files
         self.current_index = 0
-        self.load_current_image()
+        self.load_current_file()
 
-    def load_current_image(self):
+    def load_current_file(self):
+        """画像か動画かに応じてロード先を振り分ける"""
         if not self.image_list:
             return
-
         path = self.image_list[self.current_index]
-        self.current_path = path
+        if path.lower().endswith(SUPPORTED_VIDEO_EXT):
+            self.load_video(path)
+        else:
+            self.load_current_image(path)
 
+    def load_current_image(self, path: str = None):
+        """画像モードでファイルをロード"""
+        # 動画状態をリセット
+        if self.video_cap is not None:
+            self.video_cap.release()
+            self.video_cap = None
+        self.is_video = False
+        self.video_masks = {}
+        if self.frame_label:
+            self.frame_label.config(text="")
+
+        if path is None:
+            if not self.image_list:
+                return
+            path = self.image_list[self.current_index]
+
+        self.current_path = path
         img = Image.open(path).convert("RGB")
         self.original_image = img.copy()
-
         w, h = img.size
         self.mosaic_mask = np.zeros((h, w), dtype=np.uint8)
-
         self.undo_stack.clear()
         self.redo_stack.clear()
         self.clear_selection()
-
+        self.zoom = 1.0
+        self._canvas_xview = 0.0
+        self._canvas_yview = 0.0
         self.update_view()
+        self.root.title(
+            f"Mosaic Editor - {os.path.basename(path)} ({self.current_index + 1}/{len(self.image_list)})"
+        )
 
+    def load_video(self, path: str):
+        """動画モードでファイルをロード"""
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            messagebox.showerror("エラー", f"動画を開けませんでした:\n{path}")
+            return
+        # 前の動画を解放
+        if self.video_cap is not None:
+            self.video_cap.release()
+
+        self.is_video = True
+        self.video_cap = cap
+        self.video_total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self.video_frame_index = 0
+        self.video_masks = {}
+        self.current_path = path
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.clear_selection()
         self.zoom = 1.0
         self._canvas_xview = 0.0
         self._canvas_yview = 0.0
         self.root.title(
-            f"Mosaic Editor - {os.path.basename(path)} ({self.current_index + 1}/{len(self.image_list)})"
+            f"Mosaic Editor [VIDEO] - {os.path.basename(path)} ({self.current_index + 1}/{len(self.image_list)})"
         )
+        self.load_frame_at(0)
+
+    def load_frame_at(self, index: int):
+        """指定フレームを読み込んで表示"""
+        if self.video_cap is None:
+            return
+        index = max(0, min(self.video_total_frames - 1, index))
+        self.video_frame_index = index
+        self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+        ret, frame_bgr = self.video_cap.read()
+        if not ret:
+            return
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        self.original_image = Image.fromarray(frame_rgb)
+        h, w = frame_bgr.shape[:2]
+        # そのフレームのマスクを取得（未編集なら零写起こし）
+        self.mosaic_mask = self.video_masks.get(index, np.zeros((h, w), dtype=np.uint8)).copy()
+        self.update_view()
+        if self.frame_label:
+            self.frame_label.config(
+                text=f"フレーム: {index + 1} / {self.video_total_frames}  ({index / self.video_fps:.2f}s)"
+            )
+
+    def _navigate_frame(self, delta: int):
+        """現在フレームのマスクを保存してdelta分移動"""
+        if not self.is_video:
+            return
+        # 現在フレームのマスクを保存
+        if self.mosaic_mask is not None and np.any(self.mosaic_mask):
+            self.video_masks[self.video_frame_index] = self.mosaic_mask.copy()
+        self.load_frame_at(self.video_frame_index + delta)
 
     def save_current(self, show_dialog=True):
         if self.current_path is None or self.output_folder is None:
             return
 
+        if self.is_video:
+            # 動画モード: 現在フレームのマスクを保存して動画をエクスポート
+            if self.mosaic_mask is not None and np.any(self.mosaic_mask):
+                self.video_masks[self.video_frame_index] = self.mosaic_mask.copy()
+            if show_dialog:
+                self._save_video()
+            return
+
+        # 画像モードの保存
         clean_np = self.generate_mosaic_image()
         if clean_np is None:
             return
 
         img_to_save = Image.fromarray(clean_np)
-
         path = self.current_path
         folder = self.output_folder
 
@@ -677,6 +849,250 @@ class MosaicEditor:
 
         if show_dialog:
             messagebox.showinfo("保存", f"{save_path} に保存しました")
+
+    def _save_video(self):
+        """動画をモザイク適用してMP4で保存（バックグラウンド）"""
+        if self.video_cap is None or self.current_path is None or self.output_folder is None:
+            return
+
+        base_name = os.path.splitext(os.path.basename(self.current_path))[0]
+        save_path = os.path.join(self.output_folder, base_name + ".mp4")
+        total = self.video_total_frames
+        fps = self.video_fps
+
+        # プログレスダイアログ
+        prog_win = tk.Toplevel(self.root)
+        prog_win.title("動画出力中...")
+        prog_win.geometry("380x110")
+        prog_win.resizable(False, False)
+        prog_win.grab_set()
+        tk.Label(prog_win, text=f"保存先: {save_path}",
+                 font=("", 8), fg="gray", wraplength=360).pack(pady=(8, 2))
+        bar = ttk.Progressbar(prog_win, maximum=total, length=340)
+        bar.pack(padx=20, pady=4)
+        pct_label = tk.Label(prog_win, text="0 / 0", font=("", 9))
+        pct_label.pack()
+
+        # 元画像サイズを取得
+        self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        ret, first = self.video_cap.read()
+        if not ret:
+            prog_win.destroy()
+            messagebox.showerror("エラー", "動画のフレームを読み出せません")
+            return
+        h, w = first.shape[:2]
+        fourcc = cv2.VideoWriter.fourcc(*"mp4v")
+        writer = cv2.VideoWriter(save_path, fourcc, fps, (w, h))
+
+        vid_masks = self.video_masks
+        mosaic_sz = self.get_block_size()
+
+        def worker():
+            self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            for fi in range(total):
+                ret, frame_bgr = self.video_cap.read()
+                if not ret:
+                    break
+                mask = vid_masks.get(fi)
+                if mask is not None and np.any(mask):
+                    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                    block = max(2, mosaic_sz)
+                    sh, sw = frame_rgb.shape[:2]
+                    small = cv2.resize(frame_rgb, (max(1, sw // block), max(1, sh // block)),
+                                       interpolation=cv2.INTER_LINEAR)
+                    mosaic_full = cv2.resize(small, (sw, sh), interpolation=cv2.INTER_NEAREST)
+                    mask_bool = mask > 0
+                    frame_rgb[mask_bool] = mosaic_full[mask_bool]
+                    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                writer.write(frame_bgr)
+                if fi % 10 == 0:
+                    self.root.after(0, lambda f=fi: (
+                        bar.config(value=f),
+                        pct_label.config(text=f"{f + 1} / {total}")
+                    ))
+            writer.release()
+            self.root.after(0, lambda: _on_done())
+
+        def _on_done():
+            bar.config(value=total)
+            prog_win.destroy()
+            # 動画保存後、音声マージ処理に移行
+            self._merge_audio(self.current_path, save_path)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _merge_audio(self, orig_path: str, new_path: str):
+        """保存された無音動画に元の音声を結合する"""
+        try:
+            import moviepy.editor as mp  # type: ignore
+            self._run_audio_merge(orig_path, new_path)
+        except ImportError:
+            if messagebox.askyesno(
+                "moviepy 自動インストール",
+                "動画の音声を維持するために 'moviepy' ライブラリが必要です。\n"
+                "自動的にインストールしますか？\n\n"
+                "（「いいえ」を選ぶと無音のまま完了します）"
+            ):
+                self._install_moviepy_and_merge(orig_path, new_path)
+            else:
+                messagebox.showinfo("保存完了", f"無音のまま動画を保存しました:\n{new_path}")
+
+    def _install_moviepy_and_merge(self, orig_path: str, new_path: str):
+        import subprocess
+        import queue
+
+        progress_win = tk.Toplevel(self.root)
+        progress_win.title("moviepy インストール中")
+        progress_win.geometry("520x300")
+        progress_win.resizable(True, True)
+        progress_win.grab_set()
+
+        tk.Label(progress_win, text="moviepy をインストール中...",
+                 font=("", 10, "bold"), pady=6).pack()
+
+        bar = ttk.Progressbar(progress_win, mode="indeterminate", length=490)
+        bar.pack(padx=10)
+        bar.start(12)
+
+        frame = tk.Frame(progress_win)
+        frame.pack(fill="both", expand=True, padx=10, pady=6)
+        log_text = tk.Text(frame, height=12, wrap="word", state="disabled",
+                           bg="#1e1e1e", fg="#cccccc", font=("Consolas", 9))
+        log_text.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(frame, command=log_text.yview)
+        sb.pack(side="right", fill="y")
+        log_text.config(yscrollcommand=sb.set)
+
+        log_queue: "queue.Queue[str]" = __import__("queue").Queue()
+
+        def append_log(line: str):
+            log_text.config(state="normal")
+            log_text.insert("end", line)
+            log_text.see("end")
+            log_text.config(state="disabled")
+
+        def poll_queue():
+            try:
+                while True:
+                    line = log_queue.get_nowait()
+                    append_log(line)
+            except __import__("queue").Empty:
+                pass
+            if progress_win.winfo_exists():
+                progress_win.after(100, poll_queue)
+
+        def do_install():
+            def run_pip(*args):
+                proc = subprocess.Popen(
+                    [sys.executable, "-m", "pip"] + list(args),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                for line in proc.stdout:  # type: ignore
+                    log_queue.put(line)
+                proc.wait()
+                return proc.returncode == 0
+
+            log_queue.put("\n⏳ moviepy をインストール中...\n")
+            ok = run_pip("install", "--no-cache-dir", "moviepy")
+            if not ok:
+                log_queue.put("❌ moviepy インストール失敗\n")
+                self.root.after(0, lambda: self._moviepy_install_fail(progress_win, new_path, "moviepy インストール失敗"))
+                return
+
+            log_queue.put("\n✅ インストール完了！音声合成を開始します。\n")
+            self.root.after(0, lambda: self._moviepy_install_success(progress_win, orig_path, new_path))
+
+        progress_win.after(100, poll_queue)
+        threading.Thread(target=do_install, daemon=True).start()
+
+    def _moviepy_install_fail(self, progress_win, new_path: str, err: str):
+        progress_win.title("インストール失敗")
+        for w in progress_win.winfo_children():
+            if isinstance(w, ttk.Progressbar):
+                w.stop()
+        tk.Label(
+            progress_win,
+            text=f"❌ {err}\n\n手動インストール:\n  pip install moviepy\n\n（今回は無音のまま完了します）",
+            fg="red", justify="left", wraplength=480, pady=6
+        ).pack()
+        tk.Button(progress_win, text="閉じる", command=lambda: (progress_win.destroy(), messagebox.showinfo("保存完了", f"無音のまま保存しました:\n{new_path}")),
+                  bg="#cc4444", fg="white", relief="flat", padx=12, pady=4).pack(pady=6)
+
+    def _moviepy_install_success(self, progress_win, orig_path: str, new_path: str):
+        progress_win.destroy()
+        self._run_audio_merge(orig_path, new_path)
+
+    def _run_audio_merge(self, orig_path: str, new_path: str):
+        wait_win = tk.Toplevel(self.root)
+        wait_win.title("音声結合中...")
+        wait_win.geometry("380x100")
+        wait_win.resizable(False, False)
+        wait_win.grab_set()
+        tk.Label(wait_win, text="元の動画から音声を抽出して結合しています...\n（処理に時間がかかる場合があります）", pady=12).pack()
+        bar = ttk.Progressbar(wait_win, mode="indeterminate", length=340)
+        bar.pack(padx=20)
+        bar.start(10)
+
+        def merge_worker():
+            try:
+                import moviepy.editor as mp  # type: ignore
+                import tempfile
+                import shutil
+                
+                # moviepyで元動画と出力動画を開く
+                orig_clip = mp.VideoFileClip(orig_path)
+                new_clip = mp.VideoFileClip(new_path)
+                
+                if orig_clip.audio is None:
+                    # 元から音声がない場合
+                    orig_clip.close()
+                    new_clip.close()
+                    self.root.after(0, lambda: _on_merge_done(new_path, "元動画に音声がありませんでした。"))
+                    return
+
+                # 音声をセット
+                final_clip = new_clip.set_audio(orig_clip.audio)
+
+                # 一時ファイルとして書き出し
+                tmp_fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
+                os.close(tmp_fd)
+                
+                # ロガー出力を抑制して書き出し
+                final_clip.write_videofile(tmp_path, codec="libx264", audio_codec="aac", logger=None)
+                
+                orig_clip.close()
+                new_clip.close()
+                final_clip.close()
+
+                # 上書き
+                shutil.move(tmp_path, new_path)
+                
+                self.root.after(0, lambda: _on_merge_done(new_path, "音声の結合が完了しました。"))
+
+            except Exception as e:
+                err_msg = str(e)
+                self.root.after(0, lambda emsg=err_msg: _on_merge_error(new_path, emsg))
+
+        def _on_merge_done(saved_path, ext_msg):
+            try:
+                wait_win.destroy()
+            except Exception:
+                pass
+            messagebox.showinfo("保存完了", f"{ext_msg}\n{saved_path}")
+
+        def _on_merge_error(saved_path, err):
+            try:
+                wait_win.destroy()
+            except Exception:
+                pass
+            messagebox.showwarning("音声結合エラー", f"音声の結合に失敗しました（無音で保存されます）:\n{err}")
+            messagebox.showinfo("保存完了", f"{saved_path}")
+
+        threading.Thread(target=merge_worker, daemon=True).start()
 
     def display_image(self, preview=None):
         img_src = preview if preview else self.image
@@ -701,16 +1117,25 @@ class MosaicEditor:
             )
 
     def next_image(self):
-        self.save_current(show_dialog=False)
+        if self.is_video:
+            # 動画時は現在フレームのマスクを保存して次のファイルへ
+            if self.mosaic_mask is not None and np.any(self.mosaic_mask):
+                self.video_masks[self.video_frame_index] = self.mosaic_mask.copy()
+        else:
+            self.save_current(show_dialog=False)
         if hasattr(self, 'image_list') and self.current_index < len(self.image_list) - 1:
             self.current_index += 1
-            self.load_current_image()
+            self.load_current_file()
 
     def prev_image(self):
-        self.save_current(show_dialog=False)
+        if self.is_video:
+            if self.mosaic_mask is not None and np.any(self.mosaic_mask):
+                self.video_masks[self.video_frame_index] = self.mosaic_mask.copy()
+        else:
+            self.save_current(show_dialog=False)
         if self.current_index > 0:
             self.current_index -= 1
-            self.load_current_image()
+            self.load_current_file()
 
     # ================= 自動検出 (YOLO) =================
 
@@ -783,20 +1208,51 @@ class MosaicEditor:
         if not model_path:
             return
 
-        # ── 信頼度スコア入力ダイアログ ────────────────────────
         conf_win = tk.Toplevel(self.root)
         conf_win.title("YOLO 検出設定")
-        conf_win.geometry("320x140")
+        conf_win.geometry("360x280" if self.is_video else "360x240")
         conf_win.resizable(False, False)
         conf_win.grab_set()
 
         tk.Label(conf_win, text="信頼度スコア閾値 (推奨: 0.5〜0.8)",
-                 font=("", 9)).pack(pady=(10, 4))
+                 font=("", 9)).pack(pady=(8, 0))
         conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.5))
         conf_scale = tk.Scale(conf_win, from_=0.1, to=1.0, resolution=0.05,
                               variable=conf_var, orient=tk.HORIZONTAL, length=260,
                               showvalue=True)
         conf_scale.pack(padx=20)
+
+        # 対象クラス選択
+        tk.Label(conf_win, text="検出対象:", font=("", 9)).pack(pady=(4, 0))
+        cls_frm = tk.Frame(conf_win)
+        cls_frm.pack(pady=2)
+        
+        # 過去の選択状態があれば復元、なければ全てTrue
+        if not hasattr(self, '_yolo_target_classes'):
+            self._yolo_target_classes = {
+                "nipples": True, "pussy": True, "anus": True, "penis": True,
+                "testicles": True, "x-ray": True, "cross-section": True
+            }
+        
+        cls_vars = {}
+        row, col = 0, 0
+        for i, cname in enumerate(self._yolo_target_classes.keys()):
+            var = tk.BooleanVar(value=self._yolo_target_classes[cname])
+            cls_vars[cname] = var
+            tk.Checkbutton(cls_frm, text=cname, variable=var).grid(row=row, column=col, sticky="w", padx=4)
+            col += 1
+            if col > 2:
+                col = 0
+                row += 1
+
+        # 動画の場合のみ全フレーム選択UIを追加
+        process_all_var = tk.BooleanVar(value=False)
+        if self.is_video:
+            tk.Label(conf_win, text="処理対象:", font=("", 9)).pack(pady=(6, 0))
+            frm_rad = tk.Frame(conf_win)
+            frm_rad.pack()
+            tk.Radiobutton(frm_rad, text="現在のフレーム", variable=process_all_var, value=False).pack(side="left", padx=4)
+            tk.Radiobutton(frm_rad, text="動画全フレーム", variable=process_all_var, value=True).pack(side="left", padx=4)
 
         btn_frm = tk.Frame(conf_win)
         btn_frm.pack(pady=8)
@@ -817,13 +1273,20 @@ class MosaicEditor:
             return
 
         conf = conf_var.get()
+        process_all = process_all_var.get()
         self._yolo_conf = conf  # 次回起動時の初期値として記憶
+        
+        # 選択されたクラスを記憶
+        target_classes = [cname for cname, var in cls_vars.items() if var.get()]
+        for cname in self._yolo_target_classes:
+            self._yolo_target_classes[cname] = cname in target_classes
 
         # ultralytics がインストール済みか確認
         try:
             import ultralytics  # type: ignore  # noqa: F401
-            self.push_history()
-            self._run_yolo_detection(model_path, conf=conf)
+            if not process_all:
+                self.push_history()
+            self._run_yolo_detection(model_path, conf=conf, process_all=process_all, target_classes=target_classes)
         except ImportError:
             if not messagebox.askyesno(
                 "ultralytics 自動インストール",
@@ -832,12 +1295,11 @@ class MosaicEditor:
                 "（pip install ultralytics を実行します）"
             ):
                 return
-            self._install_and_detect_yolo(model_path, conf=conf)
-
+            self._install_and_detect_yolo(model_path, conf=conf, process_all=process_all, target_classes=target_classes)
 
     # ── インストール ────────────────────────────────────────
 
-    def _install_and_detect_yolo(self, model_path: str, conf: float = 0.5):
+    def _install_and_detect_yolo(self, model_path: str, conf: float = 0.5, process_all: bool = False, target_classes: list = None):
         """バックグラウンドで ultralytics をインストールして検出を実行する"""
         import subprocess
         import queue
@@ -905,16 +1367,17 @@ class MosaicEditor:
                 return
 
             log_queue.put("\n✅ インストール完了！検出を開始します。\n")
-            self.root.after(0, lambda: self._yolo_install_success(progress_win, model_path, conf))
+            self.root.after(0, lambda: self._yolo_install_success(progress_win, model_path, conf, process_all, target_classes))
 
         progress_win.after(100, poll_queue)
         threading.Thread(target=do_install, daemon=True).start()
 
-    def _yolo_install_success(self, progress_win, model_path: str, conf: float = 0.5):
+    def _yolo_install_success(self, progress_win, model_path: str, conf: float = 0.5, process_all: bool = False, target_classes: list = None):
         progress_win.destroy()
         messagebox.showinfo("完了", "ultralytics のインストールが完了しました！\n検出を開始します。")
-        self.push_history()
-        self._run_yolo_detection(model_path, conf=conf)
+        if not process_all:
+            self.push_history()
+        self._run_yolo_detection(model_path, conf=conf, process_all=process_all, target_classes=target_classes)
 
     def _yolo_install_fail(self, progress_win, err: str):
         progress_win.title("インストール失敗")
@@ -931,25 +1394,43 @@ class MosaicEditor:
 
     # ── 推論 ────────────────────────────────────────────────
 
-    def _run_yolo_detection(self, model_path: str, conf: float = 0.5):
+    def _run_yolo_detection(self, model_path: str, conf: float = 0.5, process_all: bool = False, target_classes: list = None):
         """YOLOで推論実行（セグメンテーション対応 / バックグラウンドスレッド）"""
         if self.original_image is None:
             return
 
         wait_win = tk.Toplevel(self.root)
         wait_win.title("YOLO 自動検出中")
-        wait_win.geometry("360x100")
+        wait_win.geometry("360x130" if process_all else "360x100")
         wait_win.resizable(False, False)
         wait_win.grab_set()
-        tk.Label(wait_win, text="検出中です。しばらくお待ちください...",
-                 pady=12).pack()
-        bar = ttk.Progressbar(wait_win, mode="indeterminate", length=320)
-        bar.pack(padx=20)
-        bar.start(10)
+
+        msg = "全フレーム一括検出中..." if process_all else "検出中です。しばらくお待ちください..."
+        tk.Label(wait_win, text=msg, pady=12).pack()
+
+        if process_all:
+            bar = ttk.Progressbar(wait_win, maximum=max(1, self.video_total_frames), length=320)
+            bar.pack(padx=20)
+            pct_label = tk.Label(wait_win, text=f"0 / {self.video_total_frames}", font=("", 9))
+            pct_label.pack()
+        else:
+            bar = ttk.Progressbar(wait_win, mode="indeterminate", length=320)
+            bar.pack(padx=20)
+            bar.start(10)
+
         tk.Label(wait_win, text=f"conf={conf:.1f}  model={os.path.basename(model_path)}",
                  font=("", 8), fg="gray").pack()
 
-        img_copy = self.original_image.copy()
+        # キャンセル用フラグ
+        self._yolo_cancel = False
+        if process_all:
+            def _cancel():
+                self._yolo_cancel = True
+                wait_win.destroy()
+            tk.Button(wait_win, text="キャンセル", command=_cancel,
+                      relief="flat", padx=8, pady=0).pack(pady=4)
+
+        current_img_copy = self.original_image.copy()
 
         def detect_worker():
             try:
@@ -958,30 +1439,129 @@ class MosaicEditor:
 
                 model = YOLO(model_path)
 
-                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-                    tmp_path = tmp.name
-                    img_copy.save(tmp_path, "JPEG", quality=95)
+                if not process_all:
+                    # 単一フレーム処理
+                    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                        tmp_path = tmp.name
+                        current_img_copy.save(tmp_path, "JPEG", quality=95)
 
-                results = model(
-                    tmp_path,
-                    verbose=False,
-                    conf=conf,
-                    imgsz=640,
-                )
-                os.unlink(tmp_path)
+                    results = model(tmp_path, verbose=False, conf=conf, imgsz=640)
+                    os.unlink(tmp_path)
+                    if not self._yolo_cancel:
+                        self.root.after(0, lambda: self._apply_yolo_result(
+                            wait_win, results, model_path, current_img_copy, target_classes))
+                else:
+                    # 全フレーム一括処理
+                    vid_masks = self.video_masks
+                    total = self.video_total_frames
+                    w, h = self.original_image.size
+                    self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-                self.root.after(0, lambda: self._apply_yolo_result(
-                    wait_win, results, model_path, img_copy))
+                    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                        tmp_path = tmp.name
 
+                    applied_frames = 0
+                    for fi in range(total):
+                        if self._yolo_cancel:
+                            break
+                        ret, frame_bgr = self.video_cap.read()
+                        if not ret:
+                            break
+                        
+                        # RGB変換してから一時保存
+                        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                        pil_img = Image.fromarray(frame_rgb)
+                        pil_img.save(tmp_path, "JPEG", quality=95)
+
+                        # 推論
+                        results = model(tmp_path, verbose=False, conf=conf, imgsz=640)
+                        
+                        # 自動マスク生成
+                        mask_np = np.zeros((h, w), dtype=np.uint8)
+                        has_applied = False
+                        
+                        try:
+                            boxes = results[0].boxes
+                            masks_data = results[0].masks
+                            class_names = results[0].names
+                            
+                            if masks_data is not None and len(masks_data) > 0:
+                                # セグメント適用
+                                seg_masks = masks_data.data.cpu().numpy()
+                                for i in range(len(seg_masks)):
+                                    cls_id = int(boxes.cls[i]) if boxes is not None else 0
+                                    cls_name = class_names.get(cls_id, str(cls_id))
+                                    if target_classes and cls_name not in target_classes:
+                                        continue
+                                        
+                                    if float(boxes.conf[i]) >= conf:
+                                        m_f = seg_masks[i]
+                                        m_u8 = (m_f * 255).astype(np.uint8)
+                                        m_res = cv2.resize(m_u8, (w, h), interpolation=cv2.INTER_LINEAR)
+                                        mask_np[m_res > 127] = 255
+                                        has_applied = True
+                            elif boxes is not None and len(boxes) > 0:
+                                # バウディングボックスフォールバック
+                                for i in range(len(boxes)):
+                                    cls_id = int(boxes.cls[i])
+                                    cls_name = class_names.get(cls_id, str(cls_id))
+                                    if target_classes and cls_name not in target_classes:
+                                        continue
+
+                                    if float(boxes.conf[i]) >= conf:
+                                        xyxy = boxes.xyxy[i].tolist()
+                                        bx1, by1, bx2, by2 = xyxy
+                                        if max(abs(bx1), abs(by1), abs(bx2), abs(by2)) <= 1.0:
+                                            bx1, by1 = bx1 * w, by1 * h
+                                            bx2, by2 = bx2 * w, by2 * h
+                                        x1, y1 = max(0, int(min(bx1, bx2))), max(0, int(min(by1, by2)))
+                                        x2, y2 = min(w, int(max(bx1, bx2))), min(h, int(max(by1, by2)))
+                                        mask_np[y1:y2, x1:x2] = 255
+                                        has_applied = True
+                        except Exception:
+                            pass
+                        
+                        if has_applied:
+                            # 既存の手動マスクがあれば合成、なければ新規
+                            if self.video_masks.get(fi) is not None:
+                                self.video_masks[fi] = np.maximum(self.video_masks[fi], mask_np)
+                            else:
+                                self.video_masks[fi] = mask_np
+                            applied_frames += 1
+
+                        if fi % 5 == 0:
+                            self.root.after(0, lambda f=fi: (
+                                bar.config(value=f+1),
+                                pct_label.config(text=f"{f+1} / {total}")
+                            ))
+
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+                    
+                    if not self._yolo_cancel:
+                        self.root.after(0, lambda: _on_batch_done(applied_frames))
+                        
             except Exception as e:
-                self.root.after(0, lambda: self._yolo_error(wait_win, str(e)))
+                err_msg = str(e)
+                self.root.after(0, lambda emsg=err_msg: self._yolo_error(wait_win, emsg))
+
+        def _on_batch_done(applied_count):
+            try:
+                wait_win.destroy()
+            except Exception:
+                pass
+            # カレントフレームの表示を再読み込みして反映
+            self.load_frame_at(self.video_frame_index)
+            messagebox.showinfo("一括検出完了", f"全 {self.video_total_frames} フレーム中、\n{applied_count} フレームにモザイクを適用しました。")
 
         threading.Thread(target=detect_worker, daemon=True).start()
 
     # ── 結果適用 ────────────────────────────────────────────
 
     def _apply_yolo_result(self, wait_win, results, model_path: str,
-                           orig_pil=None):
+                           orig_pil=None, target_classes: list = None):
         """検出結果をプレビューダイアログで確認後にマスクへ反映（seg/det両対応）"""
         try:
             wait_win.destroy()
@@ -1014,6 +1594,9 @@ class MosaicEditor:
                     conf_val = float(boxes.conf[i]) if boxes is not None else 0.0
                     cls_id   = int(boxes.cls[i]) if boxes is not None else 0
                     cls_name = class_names.get(cls_id, str(cls_id))
+                    
+                    if target_classes and cls_name not in target_classes:
+                        continue
 
                     # バウンディングボックス（表示用）
                     xyxy = boxes.xyxy[i].tolist() if boxes is not None else [0, 0, img_w, img_h]
@@ -1040,6 +1623,10 @@ class MosaicEditor:
                     conf_val = float(boxes.conf[i])
                     cls_id   = int(boxes.cls[i])
                     cls_name = class_names.get(cls_id, str(cls_id))
+                    
+                    if target_classes and cls_name not in target_classes:
+                        continue
+                        
                     bx1, by1, bx2, by2 = xyxy
                     if max(abs(bx1), abs(by1), abs(bx2), abs(by2)) <= 1.0:
                         bx1, by1 = bx1 * img_w, by1 * img_h
