@@ -127,6 +127,9 @@ class MosaicEditor:
             self.image_list = all_files
             self.current_index = 0
             self.load_current_file()
+            # フォルダD&D後に自動検出をオファー
+            if len(all_files) > 1 or (len(all_files) == 1 and os.path.isdir(paths[0].strip())):
+                self.root.after(200, self._offer_folder_auto_detect)
         except Exception as e:
             messagebox.showerror("D&Dエラー", str(e))
 
@@ -140,6 +143,13 @@ class MosaicEditor:
         return ix, iy
 
     # ================= Utility =================
+
+    def get_mask_path(self, img_path: str) -> str:
+        """画像に対応するマスクNPZファイルのパスを返す"""
+        if self.output_folder is None:
+            return ""
+        base = os.path.splitext(os.path.basename(img_path))[0]
+        return os.path.join(self.output_folder, base + ".mask.npz")
 
     def get_block_size(self, img_w: int = 0, img_h: int = 0) -> int:
         """ブロックサイズを取得。自動モード時は視親規定に基づく計算。
@@ -717,6 +727,8 @@ class MosaicEditor:
         self.image_list = files
         self.current_index = 0
         self.load_current_file()
+        # フォルダ読込後に自動検出をオファー
+        self.root.after(200, self._offer_folder_auto_detect)
 
     def load_current_file(self):
         """画像か動画かに応じてロード先を振り分ける"""
@@ -748,7 +760,21 @@ class MosaicEditor:
         img = Image.open(path).convert("RGB")
         self.original_image = img.copy()
         w, h = img.size
-        self.mosaic_mask = np.zeros((h, w), dtype=np.uint8)
+        # 保存済みマスクがあれば復元
+        mask_path = self.get_mask_path(path)
+        if mask_path and os.path.exists(mask_path):
+            try:
+                data = np.load(mask_path)
+                loaded = data["mask"]
+                if loaded.shape == (h, w):
+                    self.mosaic_mask = loaded.copy()
+                else:
+                    # サイズ不一致はリサイズして対応
+                    self.mosaic_mask = cv2.resize(loaded, (w, h), interpolation=cv2.INTER_NEAREST)
+            except Exception:
+                self.mosaic_mask = np.zeros((h, w), dtype=np.uint8)
+        else:
+            self.mosaic_mask = np.zeros((h, w), dtype=np.uint8)
         self.undo_stack.clear()
         self.redo_stack.clear()
         self.clear_selection()
@@ -846,6 +872,17 @@ class MosaicEditor:
 
         # JPEG形式で保存（品質95）
         img_to_save.save(save_path, "JPEG", quality=95)
+
+        # マスクをNPZに保存（空ならファイル削除）
+        mask_path = self.get_mask_path(path)
+        if mask_path:
+            if self.mosaic_mask is not None and np.any(self.mosaic_mask):
+                np.savez_compressed(mask_path, mask=self.mosaic_mask)
+            elif os.path.exists(mask_path):
+                try:
+                    os.remove(mask_path)
+                except Exception:
+                    pass
 
         if show_dialog:
             messagebox.showinfo("保存", f"{save_path} に保存しました")
@@ -1755,6 +1792,280 @@ class MosaicEditor:
         except Exception:
             pass
         messagebox.showerror("YOLO エラー", f"検出中にエラーが発生しました:\n{err}")
+
+    # ================= フォルダ一括自動検出 =================
+
+    def _offer_folder_auto_detect(self):
+        """フォルダ読込後に自動検出をオファーする。YOLOモデルが見つからなければ何もしない。"""
+        if not self.image_list:
+            return
+        # 画像ファイルのみ対象
+        img_files = [p for p in self.image_list if p.lower().endswith(SUPPORTED_EXT)]
+        if not img_files:
+            return
+        # YOLOモデルを自動探索（ダイアログは出さない）
+        model_path = None
+        if hasattr(self, '_yolo_model_path') and self._yolo_model_path:
+            if os.path.isfile(self._yolo_model_path):
+                model_path = self._yolo_model_path
+        if model_path is None:
+            model_path = self._find_yolo_model()
+        if model_path is None:
+            return  # モデルが無ければ静かにスキップ
+
+        # 確認ダイアログ
+        conf_dlg = tk.Toplevel(self.root)
+        conf_dlg.title("自動モザイク")
+        conf_dlg.geometry("380x220")
+        conf_dlg.resizable(False, False)
+        conf_dlg.grab_set()
+
+        tk.Label(conf_dlg,
+                 text=f"フォルダ内の画像 {len(img_files)} 枚に\n自動モザイク (YOLO) を適用しますか？",
+                 font=("", 10), pady=8).pack()
+        tk.Label(conf_dlg, text=f"モデル: {os.path.basename(model_path)}",
+                 font=("", 8), fg="gray").pack()
+
+        tk.Label(conf_dlg, text="信頼度閾値:", font=("", 9)).pack(pady=(6, 0))
+        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.5))
+        tk.Scale(conf_dlg, from_=0.1, to=1.0, resolution=0.05,
+                 variable=conf_var, orient=tk.HORIZONTAL, length=260,
+                 showvalue=True).pack()
+
+        overwrite_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(conf_dlg, text="既存のマスクも上書きする",
+                       variable=overwrite_var).pack(pady=(4, 0))
+
+        btn_frm = tk.Frame(conf_dlg)
+        btn_frm.pack(pady=8)
+        do_run = {"ok": False}
+
+        def on_yes():
+            do_run["ok"] = True
+            conf_dlg.destroy()
+
+        tk.Button(btn_frm, text="はい、適用する", command=on_yes,
+                  bg="#3a7bd5", fg="white", relief="flat",
+                  padx=12, pady=4).pack(side="left", padx=6)
+        tk.Button(btn_frm, text="スキップ", command=conf_dlg.destroy,
+                  relief="flat", padx=8, pady=4).pack(side="left", padx=6)
+
+        conf_dlg.wait_window()
+        if not do_run["ok"]:
+            return
+
+        conf = conf_var.get()
+        self._yolo_conf = conf
+        overwrite = overwrite_var.get()
+
+        # ultralyticsが入っていなければインストール確認
+        try:
+            import ultralytics  # type: ignore  # noqa: F401
+            self._auto_detect_folder_batch(model_path, img_files, conf, overwrite)
+        except ImportError:
+            if messagebox.askyesno(
+                "ultralytics 自動インストール",
+                "ultralytics がインストールされていません。\n自動的にインストールしますか？"
+            ):
+                self._install_and_folder_batch(model_path, img_files, conf, overwrite)
+
+    def _install_and_folder_batch(self, model_path, img_files, conf, overwrite):
+        """ultralyticsをインストールして一括検出を実行"""
+        import subprocess, queue
+        progress_win = tk.Toplevel(self.root)
+        progress_win.title("ultralytics インストール中")
+        progress_win.geometry("520x300")
+        progress_win.resizable(True, True)
+        progress_win.grab_set()
+        tk.Label(progress_win, text="ultralytics をインストール中...",
+                 font=("", 10, "bold"), pady=6).pack()
+        bar = ttk.Progressbar(progress_win, mode="indeterminate", length=490)
+        bar.pack(padx=10)
+        bar.start(12)
+        frame = tk.Frame(progress_win)
+        frame.pack(fill="both", expand=True, padx=10, pady=6)
+        log_text = tk.Text(frame, height=12, wrap="word", state="disabled",
+                           bg="#1e1e1e", fg="#cccccc", font=("Consolas", 9))
+        log_text.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(frame, command=log_text.yview)
+        sb.pack(side="right", fill="y")
+        log_text.config(yscrollcommand=sb.set)
+        log_queue: "queue.Queue[str]" = __import__("queue").Queue()
+
+        def append_log(line):
+            log_text.config(state="normal")
+            log_text.insert("end", line)
+            log_text.see("end")
+            log_text.config(state="disabled")
+
+        def poll_queue():
+            try:
+                while True:
+                    line = log_queue.get_nowait()
+                    append_log(line)
+            except __import__("queue").Empty:
+                pass
+            if progress_win.winfo_exists():
+                progress_win.after(100, poll_queue)
+
+        def do_install():
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "pip", "install", "--upgrade", "--no-cache-dir", "ultralytics"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace"
+            )
+            for line in proc.stdout:
+                log_queue.put(line)
+            proc.wait()
+            if proc.returncode == 0:
+                log_queue.put("\n✅ インストール完了！検出を開始します。\n")
+                self.root.after(0, lambda: (progress_win.destroy(),
+                                            self._auto_detect_folder_batch(model_path, img_files, conf, overwrite)))
+            else:
+                log_queue.put("❌ インストール失敗\n")
+
+        progress_win.after(100, poll_queue)
+        threading.Thread(target=do_install, daemon=True).start()
+
+    def _auto_detect_folder_batch(self, model_path: str, img_files: list,
+                                   conf: float = 0.5, overwrite: bool = False):
+        """全画像にYOLO自動検出を実行してマスクNPZを保存する"""
+        total = len(img_files)
+
+        wait_win = tk.Toplevel(self.root)
+        wait_win.title("フォルダ一括自動検出中...")
+        wait_win.geometry("400x140")
+        wait_win.resizable(False, False)
+        wait_win.grab_set()
+        tk.Label(wait_win, text="全画像にYOLO自動モザイクを適用中...", pady=8).pack()
+        bar = ttk.Progressbar(wait_win, maximum=total, length=360)
+        bar.pack(padx=20)
+        pct_label = tk.Label(wait_win, text=f"0 / {total}", font=("", 9))
+        pct_label.pack(pady=2)
+
+        self._batch_cancel = False
+
+        def _cancel():
+            self._batch_cancel = True
+            wait_win.destroy()
+
+        tk.Button(wait_win, text="キャンセル", command=_cancel,
+                  relief="flat", padx=8, pady=2).pack(pady=4)
+
+        def worker():
+            try:
+                from ultralytics import YOLO  # type: ignore
+                import tempfile
+                model = YOLO(model_path)
+                applied = 0
+
+                for fi, img_path in enumerate(img_files):
+                    if self._batch_cancel:
+                        break
+
+                    mask_path = self.get_mask_path(img_path)
+                    # 既存マスクがあってoverwriteでなければスキップ
+                    if not overwrite and mask_path and os.path.exists(mask_path):
+                        self.root.after(0, lambda f=fi: (
+                            bar.config(value=f + 1),
+                            pct_label.config(text=f"{f + 1} / {total}")
+                        ))
+                        continue
+
+                    try:
+                        img_pil = Image.open(img_path).convert("RGB")
+                        w, h = img_pil.size
+                    except Exception:
+                        continue
+
+                    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                        tmp_path = tmp.name
+                        img_pil.save(tmp_path, "JPEG", quality=95)
+
+                    try:
+                        results = model(tmp_path, verbose=False, conf=conf, imgsz=640)
+                    except Exception:
+                        results = None
+                    finally:
+                        try:
+                            os.unlink(tmp_path)
+                        except Exception:
+                            pass
+
+                    if results is None:
+                        continue
+
+                    mask_np = np.zeros((h, w), dtype=np.uint8)
+                    has_applied = False
+                    try:
+                        boxes = results[0].boxes
+                        masks_data = results[0].masks
+                        class_names = results[0].names
+                        if masks_data is not None and len(masks_data) > 0:
+                            seg_masks = masks_data.data.cpu().numpy()
+                            for i in range(len(seg_masks)):
+                                cls_id = int(boxes.cls[i]) if boxes is not None else 0
+                                cls_name = class_names.get(cls_id, str(cls_id))
+                                if float(boxes.conf[i]) >= conf:
+                                    m_f = seg_masks[i]
+                                    m_u8 = (m_f * 255).astype(np.uint8)
+                                    m_res = cv2.resize(m_u8, (w, h), interpolation=cv2.INTER_LINEAR)
+                                    mask_np[m_res > 127] = 255
+                                    has_applied = True
+                        elif boxes is not None and len(boxes) > 0:
+                            for i in range(len(boxes)):
+                                if float(boxes.conf[i]) >= conf:
+                                    xyxy = boxes.xyxy[i].tolist()
+                                    bx1, by1, bx2, by2 = xyxy
+                                    if max(abs(bx1), abs(by1), abs(bx2), abs(by2)) <= 1.0:
+                                        bx1, by1 = bx1 * w, by1 * h
+                                        bx2, by2 = bx2 * w, by2 * h
+                                    x1 = max(0, int(min(bx1, bx2)))
+                                    y1 = max(0, int(min(by1, by2)))
+                                    x2 = min(w, int(max(bx1, bx2)))
+                                    y2 = min(h, int(max(by1, by2)))
+                                    mask_np[y1:y2, x1:x2] = 255
+                                    has_applied = True
+                    except Exception:
+                        pass
+
+                    if has_applied and mask_path:
+                        np.savez_compressed(mask_path, mask=mask_np)
+                        applied += 1
+
+                    self.root.after(0, lambda f=fi: (
+                        bar.config(value=f + 1),
+                        pct_label.config(text=f"{f + 1} / {total}")
+                    ))
+
+                self.root.after(0, lambda: _on_done(applied))
+
+            except Exception as e:
+                err_msg = str(e)
+                self.root.after(0, lambda emsg=err_msg: _on_error(emsg))
+
+        def _on_done(applied_count):
+            try:
+                wait_win.destroy()
+            except Exception:
+                pass
+            # 現在表示中の画像にマスクを反映
+            if not self._batch_cancel:
+                self.load_current_file()
+                messagebox.showinfo(
+                    "一括検出完了",
+                    f"全 {total} 枚中、{applied_count} 枚にモザイクを適用しました。\n"
+                    "手動で範囲を微調整してから保存してください。"
+                )
+
+        def _on_error(err):
+            try:
+                wait_win.destroy()
+            except Exception:
+                pass
+            messagebox.showerror("自動検出エラー", f"一括検出中にエラーが発生しました:\n{err}")
+
+        threading.Thread(target=worker, daemon=True).start()
 
 def _ensure_tkinterdnd2():
     """tkinterdnd2がなければ自動インストールしてからimportする"""
