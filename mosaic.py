@@ -254,8 +254,8 @@ class MosaicEditor:
         sliders_frame.pack(side="left", fill="x", expand=True, padx=5)
 
         tk.Label(sliders_frame, text="許容値 (魔法の杖)").grid(row=0, column=0, sticky="e")
-        tk.Spinbox(sliders_frame, from_=0, to=255, width=5,
-                   textvariable=self.threshold).grid(row=0, column=1, sticky="w")
+        tk.Scale(sliders_frame, from_=0, to=255, variable=self.threshold,
+                 orient=tk.HORIZONTAL, length=100).grid(row=0, column=1, sticky="w")
 
         tk.Label(sliders_frame, text="ブラシサイズ").grid(row=0, column=2, sticky="e")
         tk.Scale(sliders_frame, from_=1, to=200, variable=self.brush_size,
@@ -1816,7 +1816,7 @@ class MosaicEditor:
         # 確認ダイアログ
         conf_dlg = tk.Toplevel(self.root)
         conf_dlg.title("自動モザイク")
-        conf_dlg.geometry("380x220")
+        conf_dlg.geometry("380x320")
         conf_dlg.resizable(False, False)
         conf_dlg.grab_set()
 
@@ -1831,6 +1831,28 @@ class MosaicEditor:
         tk.Scale(conf_dlg, from_=0.1, to=1.0, resolution=0.05,
                  variable=conf_var, orient=tk.HORIZONTAL, length=260,
                  showvalue=True).pack()
+
+        # 対象クラス選択（nipplesはデフォルトでオフ）
+        tk.Label(conf_dlg, text="検出対象クラス:", font=("", 9)).pack(pady=(6, 0))
+        cls_frm = tk.Frame(conf_dlg)
+        cls_frm.pack(pady=2)
+        _default_batch_classes = {
+            "nipples": False, "pussy": True, "anus": True, "penis": True,
+            "testicles": True, "x-ray": True, "cross-section": True
+        }
+        # 前回の選択状態があれば復元（ただしnipplesの初期値はFalseのまま）
+        if not hasattr(self, '_batch_target_classes'):
+            self._batch_target_classes = dict(_default_batch_classes)
+        batch_cls_vars = {}
+        row, col = 0, 0
+        for i, cname in enumerate(_default_batch_classes.keys()):
+            var = tk.BooleanVar(value=self._batch_target_classes.get(cname, _default_batch_classes[cname]))
+            batch_cls_vars[cname] = var
+            tk.Checkbutton(cls_frm, text=cname, variable=var).grid(row=row, column=col, sticky="w", padx=4)
+            col += 1
+            if col > 2:
+                col = 0
+                row += 1
 
         overwrite_var = tk.BooleanVar(value=False)
         tk.Checkbutton(conf_dlg, text="既存のマスクも上書きする",
@@ -1857,19 +1879,23 @@ class MosaicEditor:
         conf = conf_var.get()
         self._yolo_conf = conf
         overwrite = overwrite_var.get()
+        # 選択されたクラスを記憶・取得
+        target_classes = [cname for cname, var in batch_cls_vars.items() if var.get()]
+        for cname in self._batch_target_classes:
+            self._batch_target_classes[cname] = cname in target_classes
 
         # ultralyticsが入っていなければインストール確認
         try:
             import ultralytics  # type: ignore  # noqa: F401
-            self._auto_detect_folder_batch(model_path, img_files, conf, overwrite)
+            self._auto_detect_folder_batch(model_path, img_files, conf, overwrite, target_classes)
         except ImportError:
             if messagebox.askyesno(
                 "ultralytics 自動インストール",
                 "ultralytics がインストールされていません。\n自動的にインストールしますか？"
             ):
-                self._install_and_folder_batch(model_path, img_files, conf, overwrite)
+                self._install_and_folder_batch(model_path, img_files, conf, overwrite, target_classes)
 
-    def _install_and_folder_batch(self, model_path, img_files, conf, overwrite):
+    def _install_and_folder_batch(self, model_path, img_files, conf, overwrite, target_classes=None):
         """ultralyticsをインストールして一括検出を実行"""
         import subprocess, queue
         progress_win = tk.Toplevel(self.root)
@@ -1920,7 +1946,7 @@ class MosaicEditor:
             if proc.returncode == 0:
                 log_queue.put("\n✅ インストール完了！検出を開始します。\n")
                 self.root.after(0, lambda: (progress_win.destroy(),
-                                            self._auto_detect_folder_batch(model_path, img_files, conf, overwrite)))
+                                            self._auto_detect_folder_batch(model_path, img_files, conf, overwrite, target_classes)))
             else:
                 log_queue.put("❌ インストール失敗\n")
 
@@ -1928,7 +1954,8 @@ class MosaicEditor:
         threading.Thread(target=do_install, daemon=True).start()
 
     def _auto_detect_folder_batch(self, model_path: str, img_files: list,
-                                   conf: float = 0.5, overwrite: bool = False):
+                                   conf: float = 0.5, overwrite: bool = False,
+                                   target_classes: list = None):
         """全画像にYOLO自動検出を実行してマスクNPZを保存する"""
         total = len(img_files)
 
@@ -2006,6 +2033,9 @@ class MosaicEditor:
                             for i in range(len(seg_masks)):
                                 cls_id = int(boxes.cls[i]) if boxes is not None else 0
                                 cls_name = class_names.get(cls_id, str(cls_id))
+                                # 対象クラスフィルタリング（nipplesなど除外クラスをスキップ）
+                                if target_classes and cls_name not in target_classes:
+                                    continue
                                 if float(boxes.conf[i]) >= conf:
                                     m_f = seg_masks[i]
                                     m_u8 = (m_f * 255).astype(np.uint8)
@@ -2014,6 +2044,11 @@ class MosaicEditor:
                                     has_applied = True
                         elif boxes is not None and len(boxes) > 0:
                             for i in range(len(boxes)):
+                                cls_id = int(boxes.cls[i])
+                                cls_name = class_names.get(cls_id, str(cls_id))
+                                # 対象クラスフィルタリング
+                                if target_classes and cls_name not in target_classes:
+                                    continue
                                 if float(boxes.conf[i]) >= conf:
                                     xyxy = boxes.xyxy[i].tolist()
                                     bx1, by1, bx2, by2 = xyxy
