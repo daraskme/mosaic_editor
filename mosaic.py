@@ -163,7 +163,7 @@ class MosaicEditor:
         conf_frm = tk.Frame(dlg)
         conf_frm.pack()
         tk.Label(conf_frm, text="信頼度閾値:").pack(side="left")
-        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.5))
+        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.3))
         tk.Scale(conf_frm, from_=0.1, to=1.0, resolution=0.05,
                  variable=conf_var, orient=tk.HORIZONTAL, length=180,
                  showvalue=True).pack(side="left")
@@ -1345,7 +1345,7 @@ class MosaicEditor:
 
         tk.Label(conf_win, text="信頼度スコア閾値 (推奨: 0.5〜0.8)",
                  font=("", 9)).pack(pady=(8, 0))
-        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.5))
+        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.3))
         conf_scale = tk.Scale(conf_win, from_=0.1, to=1.0, resolution=0.05,
                               variable=conf_var, orient=tk.HORIZONTAL, length=260,
                               showvalue=True)
@@ -1564,7 +1564,6 @@ class MosaicEditor:
         def detect_worker():
             try:
                 from ultralytics import YOLO  # type: ignore
-                import tempfile
 
                 model = YOLO(model_path)
                 # メインモデル以外の固定モデルをロード
@@ -1575,34 +1574,28 @@ class MosaicEditor:
                             extra_models.append(YOLO(ep))
                         except Exception:
                             pass
+                all_models = [model] + extra_models
 
                 if not process_all:
-                    # 単一フレーム処理
-                    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-                        tmp_path = tmp.name
-                        current_img_copy.save(tmp_path, "JPEG", quality=95)
-
-                    results = model(tmp_path, verbose=False, conf=conf, imgsz=640)
-                    # 追加モデルでも検出
-                    extra_results_list = []
-                    for em in extra_models:
+                    # 単一フレーム：全モデルでタイリング推論 → 合成マスクを直接適用
+                    img_np = np.array(current_img_copy)
+                    ih, iw = img_np.shape[:2]
+                    combined = np.zeros((ih, iw), dtype=np.uint8)
+                    for m in all_models:
+                        if self._yolo_cancel:
+                            break
                         try:
-                            extra_results_list.append(em(tmp_path, verbose=False, conf=conf, imgsz=640))
+                            combined = np.maximum(combined,
+                                self._detect_to_mask(m, img_np, conf, target_classes))
                         except Exception:
                             pass
-                    os.unlink(tmp_path)
                     if not self._yolo_cancel:
-                        self.root.after(0, lambda: self._apply_yolo_result(
-                            wait_win, results, model_path, current_img_copy, target_classes, extra_results_list))
+                        self.root.after(0, lambda: self._apply_combined_mask(wait_win, combined))
                 else:
                     # 全フレーム一括処理
-                    vid_masks = self.video_masks
                     total = self.video_total_frames
                     w, h = self.original_image.size
                     self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-
-                    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-                        tmp_path = tmp.name
 
                     applied_frames = 0
                     for fi in range(total):
@@ -1611,116 +1604,21 @@ class MosaicEditor:
                         ret, frame_bgr = self.video_cap.read()
                         if not ret:
                             break
-                        
-                        # RGB変換してから一時保存
+
                         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                        pil_img = Image.fromarray(frame_rgb)
-                        pil_img.save(tmp_path, "JPEG", quality=95)
-
-                        # 推論
-                        results = model(tmp_path, verbose=False, conf=conf, imgsz=640)
-
-                        # 自動マスク生成
-                        mask_np = np.zeros((h, w), dtype=np.uint8)
-                        has_applied = False
-
-                        def _merge_results_to_mask(res, msk):
-                            applied = False
+                        combined = np.zeros((h, w), dtype=np.uint8)
+                        for m in all_models:
                             try:
-                                _boxes = res[0].boxes
-                                _masks_data = res[0].masks
-                                _class_names = res[0].names
-                                if _masks_data is not None and len(_masks_data) > 0:
-                                    _segs = _masks_data.data.cpu().numpy()
-                                    for _i in range(len(_segs)):
-                                        _cid = int(_boxes.cls[_i]) if _boxes is not None else 0
-                                        _cname = _class_names.get(_cid, str(_cid))
-                                        if target_classes and _cname not in target_classes:
-                                            continue
-                                        if float(_boxes.conf[_i]) >= conf:
-                                            _mf = _segs[_i]
-                                            _mu8 = (_mf * 255).astype(np.uint8)
-                                            _mres = cv2.resize(_mu8, (w, h), interpolation=cv2.INTER_LINEAR)
-                                            msk[_mres > 127] = 255
-                                            applied = True
-                                elif _boxes is not None and len(_boxes) > 0:
-                                    for _i in range(len(_boxes)):
-                                        _cid = int(_boxes.cls[_i])
-                                        _cname = _class_names.get(_cid, str(_cid))
-                                        if target_classes and _cname not in target_classes:
-                                            continue
-                                        if float(_boxes.conf[_i]) >= conf:
-                                            _xy = _boxes.xyxy[_i].tolist()
-                                            _bx1, _by1, _bx2, _by2 = _xy
-                                            if max(abs(_bx1), abs(_by1), abs(_bx2), abs(_by2)) <= 1.0:
-                                                _bx1, _by1 = _bx1 * w, _by1 * h
-                                                _bx2, _by2 = _bx2 * w, _by2 * h
-                                            _x1 = max(0, int(min(_bx1, _bx2)))
-                                            _y1 = max(0, int(min(_by1, _by2)))
-                                            _x2 = min(w, int(max(_bx1, _bx2)))
-                                            _y2 = min(h, int(max(_by1, _by2)))
-                                            msk[_y1:_y2, _x1:_x2] = 255
-                                            applied = True
+                                combined = np.maximum(combined,
+                                    self._detect_to_mask(m, frame_rgb, conf, target_classes))
                             except Exception:
                                 pass
-                            return applied
 
-                        try:
-                            boxes = results[0].boxes
-                            masks_data = results[0].masks
-                            class_names = results[0].names
-
-                            if masks_data is not None and len(masks_data) > 0:
-                                # セグメント適用
-                                seg_masks = masks_data.data.cpu().numpy()
-                                for i in range(len(seg_masks)):
-                                    cls_id = int(boxes.cls[i]) if boxes is not None else 0
-                                    cls_name = class_names.get(cls_id, str(cls_id))
-                                    if target_classes and cls_name not in target_classes:
-                                        continue
-
-                                    if float(boxes.conf[i]) >= conf:
-                                        m_f = seg_masks[i]
-                                        m_u8 = (m_f * 255).astype(np.uint8)
-                                        m_res = cv2.resize(m_u8, (w, h), interpolation=cv2.INTER_LINEAR)
-                                        mask_np[m_res > 127] = 255
-                                        has_applied = True
-                            elif boxes is not None and len(boxes) > 0:
-                                # バウディングボックスフォールバック
-                                for i in range(len(boxes)):
-                                    cls_id = int(boxes.cls[i])
-                                    cls_name = class_names.get(cls_id, str(cls_id))
-                                    if target_classes and cls_name not in target_classes:
-                                        continue
-
-                                    if float(boxes.conf[i]) >= conf:
-                                        xyxy = boxes.xyxy[i].tolist()
-                                        bx1, by1, bx2, by2 = xyxy
-                                        if max(abs(bx1), abs(by1), abs(bx2), abs(by2)) <= 1.0:
-                                            bx1, by1 = bx1 * w, by1 * h
-                                            bx2, by2 = bx2 * w, by2 * h
-                                        x1, y1 = max(0, int(min(bx1, bx2))), max(0, int(min(by1, by2)))
-                                        x2, y2 = min(w, int(max(bx1, bx2))), min(h, int(max(by1, by2)))
-                                        mask_np[y1:y2, x1:x2] = 255
-                                        has_applied = True
-                        except Exception:
-                            pass
-
-                        # 追加モデルの結果もマージ
-                        for em in extra_models:
-                            try:
-                                er = em(tmp_path, verbose=False, conf=conf, imgsz=640)
-                                if _merge_results_to_mask(er, mask_np):
-                                    has_applied = True
-                            except Exception:
-                                pass
-                        
-                        if has_applied:
-                            # 既存の手動マスクがあれば合成、なければ新規
+                        if np.any(combined):
                             if self.video_masks.get(fi) is not None:
-                                self.video_masks[fi] = np.maximum(self.video_masks[fi], mask_np)
+                                self.video_masks[fi] = np.maximum(self.video_masks[fi], combined)
                             else:
-                                self.video_masks[fi] = mask_np
+                                self.video_masks[fi] = combined
                             applied_frames += 1
 
                         if fi % 5 == 0:
@@ -1729,14 +1627,9 @@ class MosaicEditor:
                                 pct_label.config(text=f"{f+1} / {total}")
                             ))
 
-                    try:
-                        os.unlink(tmp_path)
-                    except Exception:
-                        pass
-                    
                     if not self._yolo_cancel:
                         self.root.after(0, lambda: _on_batch_done(applied_frames))
-                        
+
             except Exception as e:
                 err_msg = str(e)
                 self.root.after(0, lambda emsg=err_msg: self._yolo_error(wait_win, emsg))
@@ -1942,7 +1835,7 @@ class MosaicEditor:
                     ex_boxes = extra_res[0].boxes
                     ex_masks_data = extra_res[0].masks
                     ex_class_names = extra_res[0].names
-                    ex_conf = getattr(self, '_yolo_conf', 0.5)
+                    ex_conf = getattr(self, '_yolo_conf', 0.3)
                     if ex_masks_data is not None and len(ex_masks_data) > 0:
                         ex_segs = ex_masks_data.data.cpu().numpy()
                         for i in range(len(ex_segs)):
@@ -1996,6 +1889,104 @@ class MosaicEditor:
             pass
         messagebox.showerror("YOLO エラー", f"検出中にエラーが発生しました:\n{err}")
 
+    # ── タイリング推論ヘルパー ──────────────────────────────────
+
+    def _detect_to_mask(self, model, img_np: np.ndarray, conf: float,
+                        target_classes, tile_size: int = 640) -> np.ndarray:
+        """1モデル・1画像で推論。大きい画像はタイリング対応。マスク(H,W uint8)を返す。"""
+        h, w = img_np.shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+
+        def _apply_res(res, ox: int, oy: int, tw: int, th: int):
+            try:
+                boxes = res[0].boxes
+                mdata = res[0].masks
+                names = res[0].names
+                if mdata is not None and len(mdata) > 0:
+                    segs = mdata.data.cpu().numpy()
+                    for i in range(len(segs)):
+                        cid = int(boxes.cls[i]) if boxes is not None else 0
+                        cname = names.get(cid, str(cid))
+                        if target_classes and cname not in target_classes:
+                            continue
+                        if float(boxes.conf[i]) >= conf:
+                            mf = segs[i]
+                            mu8 = (mf * 255).astype(np.uint8)
+                            mres = cv2.resize(mu8, (tw, th), interpolation=cv2.INTER_LINEAR)
+                            mask[oy:oy+th, ox:ox+tw] = np.maximum(
+                                mask[oy:oy+th, ox:ox+tw], mres)
+                elif boxes is not None and len(boxes) > 0:
+                    for i in range(len(boxes)):
+                        cid = int(boxes.cls[i])
+                        cname = names.get(cid, str(cid))
+                        if target_classes and cname not in target_classes:
+                            continue
+                        if float(boxes.conf[i]) >= conf:
+                            xy = boxes.xyxy[i].tolist()
+                            bx1, by1, bx2, by2 = xy
+                            if max(abs(bx1), abs(by1), abs(bx2), abs(by2)) <= 1.0:
+                                bx1, by1 = bx1 * tw, by1 * th
+                                bx2, by2 = bx2 * tw, by2 * th
+                            x1 = ox + max(0, int(min(bx1, bx2)))
+                            y1 = oy + max(0, int(min(by1, by2)))
+                            x2 = ox + min(tw, int(max(bx1, bx2)))
+                            y2 = oy + min(th, int(max(by1, by2)))
+                            x1 = max(0, min(w, x1)); y1 = max(0, min(h, y1))
+                            x2 = max(0, min(w, x2)); y2 = max(0, min(h, y2))
+                            if x2 > x1 and y2 > y1:
+                                mask[y1:y2, x1:x2] = 255
+            except Exception:
+                pass
+
+        long_side = max(w, h)
+        # 長辺に合わせた imgsz（最大1280、32の倍数）
+        imgsz = min(long_side, 1280)
+        imgsz = max(32, (imgsz // 32) * 32)
+
+        if long_side <= tile_size * 1.5:
+            try:
+                res = model(img_np, verbose=False, conf=conf, imgsz=imgsz)
+                _apply_res(res, 0, 0, w, h)
+            except Exception:
+                pass
+        else:
+            # タイリング（オーバーラップ25%）
+            stride = int(tile_size * 0.75)
+            for ty in range(0, h, stride):
+                for tx in range(0, w, stride):
+                    tx2 = min(tx + tile_size, w)
+                    ty2 = min(ty + tile_size, h)
+                    tx1 = max(0, tx2 - tile_size)
+                    ty1 = max(0, ty2 - tile_size)
+                    tile = img_np[ty1:ty2, tx1:tx2]
+                    th_t, tw_t = tile.shape[:2]
+                    try:
+                        res = model(tile, verbose=False, conf=conf, imgsz=tile_size)
+                        _apply_res(res, tx1, ty1, tw_t, th_t)
+                    except Exception:
+                        pass
+        return mask
+
+    def _apply_combined_mask(self, wait_win, combined_mask: np.ndarray):
+        """単一フレーム検出の結果マスクを適用してサマリを表示"""
+        try:
+            wait_win.destroy()
+        except Exception:
+            pass
+        if self.mosaic_mask is None:
+            return
+        if not np.any(combined_mask):
+            messagebox.showinfo("自動検出", "検出結果が見つかりませんでした。\n閾値を下げてみてください。")
+            return
+        self.mosaic_mask = np.maximum(self.mosaic_mask, combined_mask)
+        self.show_mask.set(True)
+        self.update_view()
+        px = int(np.sum(combined_mask > 0))
+        messagebox.showinfo("適用完了",
+                            f"検出領域をモザイク選択範囲に追加しました。\n"
+                            f"(適用ピクセル数: {px:,})\n"
+                            "ペン・消しゴムで微調整してから保存してください。")
+
     # ================= フォルダ一括自動検出 =================
 
     def _offer_folder_auto_detect(self):
@@ -2030,7 +2021,7 @@ class MosaicEditor:
                  font=("", 8), fg="gray").pack()
 
         tk.Label(conf_dlg, text="信頼度閾値:", font=("", 9)).pack(pady=(6, 0))
-        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.5))
+        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.3))
         tk.Scale(conf_dlg, from_=0.1, to=1.0, resolution=0.05,
                  variable=conf_var, orient=tk.HORIZONTAL, length=260,
                  showvalue=True).pack()
@@ -2186,18 +2177,18 @@ class MosaicEditor:
             try:
                 from ultralytics import YOLO  # type: ignore
                 import tempfile
-                # 固定モデルリストから最初の存在するものをメインに
+                # 固定モデルリストから全モデルをロード
                 fixed_existing = [p for p in ADDITIONAL_YOLO_MODELS if os.path.isfile(p)]
                 main_path = fixed_existing[0] if fixed_existing else model_path
-                model = YOLO(main_path)
-                # メイン以外の固定モデルをロード
-                extra_models = []
-                for ep in ADDITIONAL_YOLO_MODELS:
-                    if os.path.isfile(ep) and ep != main_path:
-                        try:
-                            extra_models.append(YOLO(ep))
-                        except Exception:
-                            pass
+                all_models = []
+                for ep in ([main_path] + [p for p in ADDITIONAL_YOLO_MODELS
+                                          if os.path.isfile(p) and p != main_path]):
+                    try:
+                        all_models.append(YOLO(ep))
+                    except Exception:
+                        pass
+                if not all_models:
+                    all_models = [YOLO(model_path)]
                 applied = 0
 
                 for fi, img_path in enumerate(img_files):
@@ -2205,7 +2196,6 @@ class MosaicEditor:
                         break
 
                     mask_path = self.get_mask_path(img_path)
-                    # 既存マスクがあってoverwriteでなければスキップ
                     if not overwrite and mask_path and os.path.exists(mask_path):
                         self.root.after(0, lambda f=fi: (
                             bar.config(value=f + 1),
@@ -2215,124 +2205,21 @@ class MosaicEditor:
 
                     try:
                         img_pil = Image.open(img_path).convert("RGB")
-                        w, h = img_pil.size
+                        img_np = np.array(img_pil)
+                        h, w = img_np.shape[:2]
                     except Exception:
                         continue
 
-                    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-                        tmp_path = tmp.name
-                        img_pil.save(tmp_path, "JPEG", quality=95)
-
-                    results = None
-                    extra_results_batch = []
-                    try:
-                        results = model(tmp_path, verbose=False, conf=conf, imgsz=640)
-                        for em in extra_models:
-                            try:
-                                extra_results_batch.append(
-                                    em(tmp_path, verbose=False, conf=conf, imgsz=640))
-                            except Exception:
-                                pass
-                    except Exception:
-                        results = None
-                    finally:
+                    combined = np.zeros((h, w), dtype=np.uint8)
+                    for m in all_models:
                         try:
-                            os.unlink(tmp_path)
+                            combined = np.maximum(combined,
+                                self._detect_to_mask(m, img_np, conf, target_classes))
                         except Exception:
                             pass
 
-                    if results is None:
-                        continue
-
-                    mask_np = np.zeros((h, w), dtype=np.uint8)
-                    has_applied = False
-
-                    def _apply_res_to_mask(res, msk, _w, _h):
-                        _applied = False
-                        try:
-                            _boxes = res[0].boxes
-                            _masks_data = res[0].masks
-                            _class_names = res[0].names
-                            if _masks_data is not None and len(_masks_data) > 0:
-                                _segs = _masks_data.data.cpu().numpy()
-                                for _i in range(len(_segs)):
-                                    _cid = int(_boxes.cls[_i]) if _boxes is not None else 0
-                                    _cname = _class_names.get(_cid, str(_cid))
-                                    if target_classes and _cname not in target_classes:
-                                        continue
-                                    if float(_boxes.conf[_i]) >= conf:
-                                        _mf = _segs[_i]
-                                        _mu8 = (_mf * 255).astype(np.uint8)
-                                        _mres = cv2.resize(_mu8, (_w, _h), interpolation=cv2.INTER_LINEAR)
-                                        msk[_mres > 127] = 255
-                                        _applied = True
-                            elif _boxes is not None and len(_boxes) > 0:
-                                for _i in range(len(_boxes)):
-                                    _cid = int(_boxes.cls[_i])
-                                    _cname = _class_names.get(_cid, str(_cid))
-                                    if target_classes and _cname not in target_classes:
-                                        continue
-                                    if float(_boxes.conf[_i]) >= conf:
-                                        _xy = _boxes.xyxy[_i].tolist()
-                                        _bx1, _by1, _bx2, _by2 = _xy
-                                        if max(abs(_bx1), abs(_by1), abs(_bx2), abs(_by2)) <= 1.0:
-                                            _bx1, _by1 = _bx1 * _w, _by1 * _h
-                                            _bx2, _by2 = _bx2 * _w, _by2 * _h
-                                        _x1 = max(0, int(min(_bx1, _bx2)))
-                                        _y1 = max(0, int(min(_by1, _by2)))
-                                        _x2 = min(_w, int(max(_bx1, _bx2)))
-                                        _y2 = min(_h, int(max(_by1, _by2)))
-                                        msk[_y1:_y2, _x1:_x2] = 255
-                                        _applied = True
-                        except Exception:
-                            pass
-                        return _applied
-
-                    try:
-                        boxes = results[0].boxes
-                        masks_data = results[0].masks
-                        class_names = results[0].names
-                        if masks_data is not None and len(masks_data) > 0:
-                            seg_masks = masks_data.data.cpu().numpy()
-                            for i in range(len(seg_masks)):
-                                cls_id = int(boxes.cls[i]) if boxes is not None else 0
-                                cls_name = class_names.get(cls_id, str(cls_id))
-                                if target_classes and cls_name not in target_classes:
-                                    continue
-                                if float(boxes.conf[i]) >= conf:
-                                    m_f = seg_masks[i]
-                                    m_u8 = (m_f * 255).astype(np.uint8)
-                                    m_res = cv2.resize(m_u8, (w, h), interpolation=cv2.INTER_LINEAR)
-                                    mask_np[m_res > 127] = 255
-                                    has_applied = True
-                        elif boxes is not None and len(boxes) > 0:
-                            for i in range(len(boxes)):
-                                cls_id = int(boxes.cls[i])
-                                cls_name = class_names.get(cls_id, str(cls_id))
-                                if target_classes and cls_name not in target_classes:
-                                    continue
-                                if float(boxes.conf[i]) >= conf:
-                                    xyxy = boxes.xyxy[i].tolist()
-                                    bx1, by1, bx2, by2 = xyxy
-                                    if max(abs(bx1), abs(by1), abs(bx2), abs(by2)) <= 1.0:
-                                        bx1, by1 = bx1 * w, by1 * h
-                                        bx2, by2 = bx2 * w, by2 * h
-                                    x1 = max(0, int(min(bx1, bx2)))
-                                    y1 = max(0, int(min(by1, by2)))
-                                    x2 = min(w, int(max(bx1, bx2)))
-                                    y2 = min(h, int(max(by1, by2)))
-                                    mask_np[y1:y2, x1:x2] = 255
-                                    has_applied = True
-                    except Exception:
-                        pass
-
-                    # 追加モデルの結果もマージ
-                    for er in extra_results_batch:
-                        if _apply_res_to_mask(er, mask_np, w, h):
-                            has_applied = True
-
-                    if has_applied and mask_path:
-                        np.savez_compressed(mask_path, mask=mask_np)
+                    if np.any(combined) and mask_path:
+                        np.savez_compressed(mask_path, mask=combined)
                         applied += 1
 
                     self.root.after(0, lambda f=fi: (
