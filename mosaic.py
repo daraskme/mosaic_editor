@@ -135,11 +135,38 @@ class MosaicEditor:
             self.image_list = all_files
             self.current_index = 0
             self.load_current_file()
-            # フォルダD&D後に自動検出をオファー
-            if len(all_files) > 1 or (len(all_files) == 1 and os.path.isdir(paths[0].strip())):
-                self.root.after(200, self._offer_folder_auto_detect)
+            # D&D後に画像ファイルがあれば自動検出を実行（確認なし）
+            img_files = [p for p in all_files if p.lower().endswith(SUPPORTED_EXT)]
+            if img_files:
+                self.root.after(300, self._auto_detect_on_dnd)
         except Exception as e:
             messagebox.showerror("D&Dエラー", str(e))
+
+    def _auto_detect_on_dnd(self):
+        """D&D後に4モデルで自動検出してモザイクを適用（確認なし）"""
+        img_files = [p for p in self.image_list if p.lower().endswith(SUPPORTED_EXT)]
+        if not img_files:
+            return
+        fixed_existing = [p for p in ADDITIONAL_YOLO_MODELS if os.path.isfile(p)]
+        if not fixed_existing:
+            return
+        conf = getattr(self, '_yolo_conf', 0.5)
+        target_classes = getattr(self, '_batch_target_classes', None)
+        if target_classes:
+            target_classes = [c for c, v in target_classes.items() if v]
+        else:
+            target_classes = None
+        try:
+            import ultralytics  # type: ignore  # noqa: F401
+            self._auto_detect_folder_batch(fixed_existing[0], img_files, conf,
+                                           overwrite=False, target_classes=target_classes)
+        except ImportError:
+            if messagebox.askyesno(
+                "ultralytics 自動インストール",
+                "ultralytics がインストールされていません。\n自動的にインストールしますか？"
+            ):
+                self._install_and_folder_batch(fixed_existing[0], img_files, conf,
+                                               False, target_classes)
 
     # ================= 座標変換 =================
 
