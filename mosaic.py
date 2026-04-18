@@ -12,6 +12,11 @@ SUPPORTED_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 SUPPORTED_VIDEO_EXT = (".mp4", ".avi", ".mov", ".mkv", ".webm")
 ALL_SUPPORTED_EXT = SUPPORTED_EXT + SUPPORTED_VIDEO_EXT
 
+# 自動検出で使用する固定モデルパス（存在するものをすべて実行）
+ADDITIONAL_YOLO_MODELS = [
+    r"C:\Users\micro\OneDrive\ドキュメント\mosaic_editor\ntd11_anime_nsfw_segm_v5-variant1.pt",
+]
+
 
 class MosaicEditor:
     def __init__(self, root):
@@ -39,7 +44,7 @@ class MosaicEditor:
         # Mode: pen, wand, eraser, rect
         self.mode = tk.StringVar(value="pen")
         self.threshold = tk.IntVar(value=40)
-        self.brush_size = tk.IntVar(value=20)
+        self.brush_size = tk.IntVar(value=40)
         self.mosaic_size = tk.IntVar(value=10)
         self.mosaic_size.trace_add("write", self.on_mosaic_size_change)
         self.auto_mosaic = tk.BooleanVar(value=True)  # 規定準拠自動サイズ
@@ -127,11 +132,95 @@ class MosaicEditor:
             self.image_list = all_files
             self.current_index = 0
             self.load_current_file()
-            # フォルダD&D後に自動検出をオファー
-            if len(all_files) > 1 or (len(all_files) == 1 and os.path.isdir(paths[0].strip())):
-                self.root.after(200, self._offer_folder_auto_detect)
+            # D&D後に画像ファイルがあれば自動検出を実行（確認なし）
+            img_files = [p for p in all_files if p.lower().endswith(SUPPORTED_EXT)]
+            if img_files:
+                self.root.after(300, self._auto_detect_on_dnd)
         except Exception as e:
             messagebox.showerror("D&Dエラー", str(e))
+
+    def _auto_detect_on_dnd(self):
+        """D&D後に確認ダイアログを出してから4モデルで自動検出（既存マスク上書き）"""
+        img_files = [p for p in self.image_list if p.lower().endswith(SUPPORTED_EXT)]
+        if not img_files:
+            return
+        fixed_existing = [p for p in ADDITIONAL_YOLO_MODELS if os.path.isfile(p)]
+        if not fixed_existing:
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("自動モザイク")
+        dlg.geometry("360x290")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        tk.Label(dlg, text=f"画像 {len(img_files)} 枚に自動モザイクを適用しますか？\n（既存マスクは上書きされます）",
+                 font=("", 9), pady=8).pack()
+
+        conf_frm = tk.Frame(dlg)
+        conf_frm.pack()
+        tk.Label(conf_frm, text="信頼度閾値:").pack(side="left")
+        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.3))
+        tk.Scale(conf_frm, from_=0.1, to=1.0, resolution=0.05,
+                 variable=conf_var, orient=tk.HORIZONTAL, length=180,
+                 showvalue=True).pack(side="left")
+
+        # 対象クラス選択
+        tk.Label(dlg, text="検出対象クラス:", font=("", 9)).pack(pady=(6, 0))
+        cls_frm = tk.Frame(dlg)
+        cls_frm.pack(pady=2)
+        _default_classes = {
+            "nipples": False, "pussy": True, "anus": True, "penis": True,
+            "testicles": True, "x-ray": True, "cross-section": True
+        }
+        if not hasattr(self, '_batch_target_classes'):
+            self._batch_target_classes = dict(_default_classes)
+        cls_vars = {}
+        row, col = 0, 0
+        for cname in _default_classes:
+            var = tk.BooleanVar(value=self._batch_target_classes.get(cname, _default_classes[cname]))
+            cls_vars[cname] = var
+            tk.Checkbutton(cls_frm, text=cname, variable=var).grid(row=row, column=col, sticky="w", padx=4)
+            col += 1
+            if col > 2:
+                col = 0
+                row += 1
+
+        do_run = {"ok": False}
+
+        def on_yes():
+            do_run["ok"] = True
+            dlg.destroy()
+
+        btn_frm = tk.Frame(dlg)
+        btn_frm.pack(pady=8)
+        tk.Button(btn_frm, text="はい", command=on_yes,
+                  bg="#3a7bd5", fg="white", relief="flat",
+                  padx=12, pady=4).pack(side="left", padx=6)
+        tk.Button(btn_frm, text="スキップ", command=dlg.destroy,
+                  relief="flat", padx=8, pady=4).pack(side="left", padx=6)
+
+        dlg.wait_window()
+        if not do_run["ok"]:
+            return
+
+        self._yolo_conf = conf_var.get()
+        conf = self._yolo_conf
+        for cname in self._batch_target_classes:
+            self._batch_target_classes[cname] = cls_vars[cname].get()
+        target_classes = [c for c, v in cls_vars.items() if v.get()] or None
+
+        try:
+            import ultralytics  # type: ignore  # noqa: F401
+            self._auto_detect_folder_batch(fixed_existing[0], img_files, conf,
+                                           overwrite=True, target_classes=target_classes)
+        except ImportError:
+            if messagebox.askyesno(
+                "ultralytics 自動インストール",
+                "ultralytics がインストールされていません。\n自動的にインストールしますか？"
+            ):
+                self._install_and_folder_batch(fixed_existing[0], img_files, conf,
+                                               True, target_classes)
 
     # ================= 座標変換 =================
 
@@ -328,6 +417,19 @@ class MosaicEditor:
             pass
 
     # ================= Zoom =================
+
+    def _zoom_to_fit(self):
+        """画像をキャンバスサイズに収まるようにズームを設定する"""
+        if self.original_image is None:
+            return
+        self.root.update_idletasks()
+        canvas_w = self.canvas.winfo_width()
+        canvas_h = self.canvas.winfo_height()
+        if canvas_w <= 1 or canvas_h <= 1:
+            self.zoom = 1.0
+            return
+        img_w, img_h = self.original_image.size
+        self.zoom = min(canvas_w / img_w, canvas_h / img_h)
 
     def on_mousewheel(self, event):
         """Windowsマウスホイール: 動画時はフレーム移動、画像時はズーム（Ctrl+ホイールは常にズーム）"""
@@ -778,9 +880,9 @@ class MosaicEditor:
         self.undo_stack.clear()
         self.redo_stack.clear()
         self.clear_selection()
-        self.zoom = 1.0
         self._canvas_xview = 0.0
         self._canvas_yview = 0.0
+        self._zoom_to_fit()
         self.update_view()
         self.root.title(
             f"Mosaic Editor - {os.path.basename(path)} ({self.current_index + 1}/{len(self.image_list)})"
@@ -806,15 +908,14 @@ class MosaicEditor:
         self.undo_stack.clear()
         self.redo_stack.clear()
         self.clear_selection()
-        self.zoom = 1.0
         self._canvas_xview = 0.0
         self._canvas_yview = 0.0
         self.root.title(
             f"Mosaic Editor [VIDEO] - {os.path.basename(path)} ({self.current_index + 1}/{len(self.image_list)})"
         )
-        self.load_frame_at(0)
+        self.load_frame_at(0, fit_zoom=True)
 
-    def load_frame_at(self, index: int):
+    def load_frame_at(self, index: int, fit_zoom: bool = False):
         """指定フレームを読み込んで表示"""
         if self.video_cap is None:
             return
@@ -827,6 +928,8 @@ class MosaicEditor:
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         self.original_image = Image.fromarray(frame_rgb)
         h, w = frame_bgr.shape[:2]
+        if fit_zoom:
+            self._zoom_to_fit()
         # そのフレームのマスクを取得（未編集なら零写起こし）
         self.mosaic_mask = self.video_masks.get(index, np.zeros((h, w), dtype=np.uint8)).copy()
         self.update_view()
@@ -1241,7 +1344,12 @@ class MosaicEditor:
             messagebox.showwarning("警告", "画像を開いてください")
             return
 
-        model_path = self._get_yolo_model_path()
+        # 固定モデルリストの最初の存在するものをメインモデルとして使用
+        fixed_existing = [p for p in ADDITIONAL_YOLO_MODELS if os.path.isfile(p)]
+        if fixed_existing:
+            model_path = fixed_existing[0]
+        else:
+            model_path = self._get_yolo_model_path()
         if not model_path:
             return
 
@@ -1253,7 +1361,7 @@ class MosaicEditor:
 
         tk.Label(conf_win, text="信頼度スコア閾値 (推奨: 0.5〜0.8)",
                  font=("", 9)).pack(pady=(8, 0))
-        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.5))
+        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.3))
         conf_scale = tk.Scale(conf_win, from_=0.1, to=1.0, resolution=0.05,
                               variable=conf_var, orient=tk.HORIZONTAL, length=260,
                               showvalue=True)
@@ -1472,30 +1580,38 @@ class MosaicEditor:
         def detect_worker():
             try:
                 from ultralytics import YOLO  # type: ignore
-                import tempfile
 
                 model = YOLO(model_path)
+                # メインモデル以外の固定モデルをロード
+                extra_models = []
+                for ep in ADDITIONAL_YOLO_MODELS:
+                    if os.path.isfile(ep) and ep != model_path:
+                        try:
+                            extra_models.append(YOLO(ep))
+                        except Exception:
+                            pass
+                all_models = [model] + extra_models
 
                 if not process_all:
-                    # 単一フレーム処理
-                    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-                        tmp_path = tmp.name
-                        current_img_copy.save(tmp_path, "JPEG", quality=95)
-
-                    results = model(tmp_path, verbose=False, conf=conf, imgsz=640)
-                    os.unlink(tmp_path)
+                    # 単一フレーム：全モデルでタイリング推論 → 合成マスクを直接適用
+                    img_np = np.array(current_img_copy)
+                    ih, iw = img_np.shape[:2]
+                    combined = np.zeros((ih, iw), dtype=np.uint8)
+                    for m in all_models:
+                        if self._yolo_cancel:
+                            break
+                        try:
+                            combined = np.maximum(combined,
+                                self._detect_to_mask(m, img_np, conf, target_classes))
+                        except Exception:
+                            pass
                     if not self._yolo_cancel:
-                        self.root.after(0, lambda: self._apply_yolo_result(
-                            wait_win, results, model_path, current_img_copy, target_classes))
+                        self.root.after(0, lambda: self._apply_combined_mask(wait_win, combined))
                 else:
                     # 全フレーム一括処理
-                    vid_masks = self.video_masks
                     total = self.video_total_frames
                     w, h = self.original_image.size
                     self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-
-                    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-                        tmp_path = tmp.name
 
                     applied_frames = 0
                     for fi in range(total):
@@ -1504,66 +1620,21 @@ class MosaicEditor:
                         ret, frame_bgr = self.video_cap.read()
                         if not ret:
                             break
-                        
-                        # RGB変換してから一時保存
+
                         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                        pil_img = Image.fromarray(frame_rgb)
-                        pil_img.save(tmp_path, "JPEG", quality=95)
+                        combined = np.zeros((h, w), dtype=np.uint8)
+                        for m in all_models:
+                            try:
+                                combined = np.maximum(combined,
+                                    self._detect_to_mask(m, frame_rgb, conf, target_classes))
+                            except Exception:
+                                pass
 
-                        # 推論
-                        results = model(tmp_path, verbose=False, conf=conf, imgsz=640)
-                        
-                        # 自動マスク生成
-                        mask_np = np.zeros((h, w), dtype=np.uint8)
-                        has_applied = False
-                        
-                        try:
-                            boxes = results[0].boxes
-                            masks_data = results[0].masks
-                            class_names = results[0].names
-                            
-                            if masks_data is not None and len(masks_data) > 0:
-                                # セグメント適用
-                                seg_masks = masks_data.data.cpu().numpy()
-                                for i in range(len(seg_masks)):
-                                    cls_id = int(boxes.cls[i]) if boxes is not None else 0
-                                    cls_name = class_names.get(cls_id, str(cls_id))
-                                    if target_classes and cls_name not in target_classes:
-                                        continue
-                                        
-                                    if float(boxes.conf[i]) >= conf:
-                                        m_f = seg_masks[i]
-                                        m_u8 = (m_f * 255).astype(np.uint8)
-                                        m_res = cv2.resize(m_u8, (w, h), interpolation=cv2.INTER_LINEAR)
-                                        mask_np[m_res > 127] = 255
-                                        has_applied = True
-                            elif boxes is not None and len(boxes) > 0:
-                                # バウディングボックスフォールバック
-                                for i in range(len(boxes)):
-                                    cls_id = int(boxes.cls[i])
-                                    cls_name = class_names.get(cls_id, str(cls_id))
-                                    if target_classes and cls_name not in target_classes:
-                                        continue
-
-                                    if float(boxes.conf[i]) >= conf:
-                                        xyxy = boxes.xyxy[i].tolist()
-                                        bx1, by1, bx2, by2 = xyxy
-                                        if max(abs(bx1), abs(by1), abs(bx2), abs(by2)) <= 1.0:
-                                            bx1, by1 = bx1 * w, by1 * h
-                                            bx2, by2 = bx2 * w, by2 * h
-                                        x1, y1 = max(0, int(min(bx1, bx2))), max(0, int(min(by1, by2)))
-                                        x2, y2 = min(w, int(max(bx1, bx2))), min(h, int(max(by1, by2)))
-                                        mask_np[y1:y2, x1:x2] = 255
-                                        has_applied = True
-                        except Exception:
-                            pass
-                        
-                        if has_applied:
-                            # 既存の手動マスクがあれば合成、なければ新規
+                        if np.any(combined):
                             if self.video_masks.get(fi) is not None:
-                                self.video_masks[fi] = np.maximum(self.video_masks[fi], mask_np)
+                                self.video_masks[fi] = np.maximum(self.video_masks[fi], combined)
                             else:
-                                self.video_masks[fi] = mask_np
+                                self.video_masks[fi] = combined
                             applied_frames += 1
 
                         if fi % 5 == 0:
@@ -1572,14 +1643,9 @@ class MosaicEditor:
                                 pct_label.config(text=f"{f+1} / {total}")
                             ))
 
-                    try:
-                        os.unlink(tmp_path)
-                    except Exception:
-                        pass
-                    
                     if not self._yolo_cancel:
                         self.root.after(0, lambda: _on_batch_done(applied_frames))
-                        
+
             except Exception as e:
                 err_msg = str(e)
                 self.root.after(0, lambda emsg=err_msg: self._yolo_error(wait_win, emsg))
@@ -1598,7 +1664,8 @@ class MosaicEditor:
     # ── 結果適用 ────────────────────────────────────────────
 
     def _apply_yolo_result(self, wait_win, results, model_path: str,
-                           orig_pil=None, target_classes: list = None):
+                           orig_pil=None, target_classes: list = None,
+                           extra_results_list: list = None):
         """検出結果をプレビューダイアログで確認後にマスクへ反映（seg/det両対応）"""
         try:
             wait_win.destroy()
@@ -1776,13 +1843,58 @@ class MosaicEditor:
                 self.mosaic_mask[c["y1"]:c["y2"], c["x1"]:c["x2"]] = 255
             applied += 1
 
+        # ── 追加モデルの結果を自動適用 ──────────────────────────
+        extra_applied = 0
+        if extra_results_list:
+            for extra_res in extra_results_list:
+                try:
+                    ex_boxes = extra_res[0].boxes
+                    ex_masks_data = extra_res[0].masks
+                    ex_class_names = extra_res[0].names
+                    ex_conf = getattr(self, '_yolo_conf', 0.3)
+                    if ex_masks_data is not None and len(ex_masks_data) > 0:
+                        ex_segs = ex_masks_data.data.cpu().numpy()
+                        for i in range(len(ex_segs)):
+                            cls_id = int(ex_boxes.cls[i]) if ex_boxes is not None else 0
+                            cls_name = ex_class_names.get(cls_id, str(cls_id))
+                            if target_classes and cls_name not in target_classes:
+                                continue
+                            if float(ex_boxes.conf[i]) >= ex_conf:
+                                mf = ex_segs[i]
+                                mu8 = (mf * 255).astype(np.uint8)
+                                mres = cv2.resize(mu8, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
+                                self.mosaic_mask[mres > 127] = 255
+                                extra_applied += 1
+                    elif ex_boxes is not None and len(ex_boxes) > 0:
+                        for i in range(len(ex_boxes)):
+                            cls_id = int(ex_boxes.cls[i])
+                            cls_name = ex_class_names.get(cls_id, str(cls_id))
+                            if target_classes and cls_name not in target_classes:
+                                continue
+                            if float(ex_boxes.conf[i]) >= ex_conf:
+                                xyxy = ex_boxes.xyxy[i].tolist()
+                                bx1, by1, bx2, by2 = xyxy
+                                if max(abs(bx1), abs(by1), abs(bx2), abs(by2)) <= 1.0:
+                                    bx1, by1 = bx1 * img_w, by1 * img_h
+                                    bx2, by2 = bx2 * img_w, by2 * img_h
+                                x1 = max(0, min(img_w, int(min(bx1, bx2))))
+                                y1 = max(0, min(img_h, int(min(by1, by2))))
+                                x2 = max(0, min(img_w, int(max(bx1, bx2))))
+                                y2 = max(0, min(img_h, int(max(by1, by2))))
+                                if x2 > x1 and y2 > y1:
+                                    self.mosaic_mask[y1:y2, x1:x2] = 255
+                                    extra_applied += 1
+                except Exception:
+                    pass
+
         self.show_mask.set(True)
         self.update_view()
 
+        extra_msg = f"\n追加モデル自動適用: {extra_applied} 箇所" if extra_applied > 0 else ""
         messagebox.showinfo(
             "適用完了",
             f"{applied} 箇所をモザイク選択範囲に追加しました。\n"
-            f"({mode_label}モードで適用)\n"
+            f"({mode_label}モードで適用){extra_msg}\n"
             "ペン・魔法の杖・消しゴムで微調整してから保存してください。"
         )
 
@@ -1792,6 +1904,104 @@ class MosaicEditor:
         except Exception:
             pass
         messagebox.showerror("YOLO エラー", f"検出中にエラーが発生しました:\n{err}")
+
+    # ── タイリング推論ヘルパー ──────────────────────────────────
+
+    def _detect_to_mask(self, model, img_np: np.ndarray, conf: float,
+                        target_classes, tile_size: int = 640) -> np.ndarray:
+        """1モデル・1画像で推論。大きい画像はタイリング対応。マスク(H,W uint8)を返す。"""
+        h, w = img_np.shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+
+        def _apply_res(res, ox: int, oy: int, tw: int, th: int):
+            try:
+                boxes = res[0].boxes
+                mdata = res[0].masks
+                names = res[0].names
+                if mdata is not None and len(mdata) > 0:
+                    segs = mdata.data.cpu().numpy()
+                    for i in range(len(segs)):
+                        cid = int(boxes.cls[i]) if boxes is not None else 0
+                        cname = names.get(cid, str(cid))
+                        if target_classes and cname not in target_classes:
+                            continue
+                        if float(boxes.conf[i]) >= conf:
+                            mf = segs[i]
+                            mu8 = (mf * 255).astype(np.uint8)
+                            mres = cv2.resize(mu8, (tw, th), interpolation=cv2.INTER_LINEAR)
+                            mask[oy:oy+th, ox:ox+tw] = np.maximum(
+                                mask[oy:oy+th, ox:ox+tw], mres)
+                elif boxes is not None and len(boxes) > 0:
+                    for i in range(len(boxes)):
+                        cid = int(boxes.cls[i])
+                        cname = names.get(cid, str(cid))
+                        if target_classes and cname not in target_classes:
+                            continue
+                        if float(boxes.conf[i]) >= conf:
+                            xy = boxes.xyxy[i].tolist()
+                            bx1, by1, bx2, by2 = xy
+                            if max(abs(bx1), abs(by1), abs(bx2), abs(by2)) <= 1.0:
+                                bx1, by1 = bx1 * tw, by1 * th
+                                bx2, by2 = bx2 * tw, by2 * th
+                            x1 = ox + max(0, int(min(bx1, bx2)))
+                            y1 = oy + max(0, int(min(by1, by2)))
+                            x2 = ox + min(tw, int(max(bx1, bx2)))
+                            y2 = oy + min(th, int(max(by1, by2)))
+                            x1 = max(0, min(w, x1)); y1 = max(0, min(h, y1))
+                            x2 = max(0, min(w, x2)); y2 = max(0, min(h, y2))
+                            if x2 > x1 and y2 > y1:
+                                mask[y1:y2, x1:x2] = 255
+            except Exception:
+                pass
+
+        long_side = max(w, h)
+        # 長辺に合わせた imgsz（最大1280、32の倍数）
+        imgsz = min(long_side, 1280)
+        imgsz = max(32, (imgsz // 32) * 32)
+
+        if long_side <= tile_size * 1.5:
+            try:
+                res = model(img_np, verbose=False, conf=conf, imgsz=imgsz)
+                _apply_res(res, 0, 0, w, h)
+            except Exception:
+                pass
+        else:
+            # タイリング（オーバーラップ25%）
+            stride = int(tile_size * 0.75)
+            for ty in range(0, h, stride):
+                for tx in range(0, w, stride):
+                    tx2 = min(tx + tile_size, w)
+                    ty2 = min(ty + tile_size, h)
+                    tx1 = max(0, tx2 - tile_size)
+                    ty1 = max(0, ty2 - tile_size)
+                    tile = img_np[ty1:ty2, tx1:tx2]
+                    th_t, tw_t = tile.shape[:2]
+                    try:
+                        res = model(tile, verbose=False, conf=conf, imgsz=tile_size)
+                        _apply_res(res, tx1, ty1, tw_t, th_t)
+                    except Exception:
+                        pass
+        return mask
+
+    def _apply_combined_mask(self, wait_win, combined_mask: np.ndarray):
+        """単一フレーム検出の結果マスクを適用してサマリを表示"""
+        try:
+            wait_win.destroy()
+        except Exception:
+            pass
+        if self.mosaic_mask is None:
+            return
+        if not np.any(combined_mask):
+            messagebox.showinfo("自動検出", "検出結果が見つかりませんでした。\n閾値を下げてみてください。")
+            return
+        self.mosaic_mask = np.maximum(self.mosaic_mask, combined_mask)
+        self.show_mask.set(True)
+        self.update_view()
+        px = int(np.sum(combined_mask > 0))
+        messagebox.showinfo("適用完了",
+                            f"検出領域をモザイク選択範囲に追加しました。\n"
+                            f"(適用ピクセル数: {px:,})\n"
+                            "ペン・消しゴムで微調整してから保存してください。")
 
     # ================= フォルダ一括自動検出 =================
 
@@ -1827,7 +2037,7 @@ class MosaicEditor:
                  font=("", 8), fg="gray").pack()
 
         tk.Label(conf_dlg, text="信頼度閾値:", font=("", 9)).pack(pady=(6, 0))
-        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.5))
+        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.3))
         tk.Scale(conf_dlg, from_=0.1, to=1.0, resolution=0.05,
                  variable=conf_var, orient=tk.HORIZONTAL, length=260,
                  showvalue=True).pack()
@@ -1983,7 +2193,18 @@ class MosaicEditor:
             try:
                 from ultralytics import YOLO  # type: ignore
                 import tempfile
-                model = YOLO(model_path)
+                # 固定モデルリストから全モデルをロード
+                fixed_existing = [p for p in ADDITIONAL_YOLO_MODELS if os.path.isfile(p)]
+                main_path = fixed_existing[0] if fixed_existing else model_path
+                all_models = []
+                for ep in ([main_path] + [p for p in ADDITIONAL_YOLO_MODELS
+                                          if os.path.isfile(p) and p != main_path]):
+                    try:
+                        all_models.append(YOLO(ep))
+                    except Exception:
+                        pass
+                if not all_models:
+                    all_models = [YOLO(model_path)]
                 applied = 0
 
                 for fi, img_path in enumerate(img_files):
@@ -1991,7 +2212,6 @@ class MosaicEditor:
                         break
 
                     mask_path = self.get_mask_path(img_path)
-                    # 既存マスクがあってoverwriteでなければスキップ
                     if not overwrite and mask_path and os.path.exists(mask_path):
                         self.root.after(0, lambda f=fi: (
                             bar.config(value=f + 1),
@@ -2001,71 +2221,21 @@ class MosaicEditor:
 
                     try:
                         img_pil = Image.open(img_path).convert("RGB")
-                        w, h = img_pil.size
+                        img_np = np.array(img_pil)
+                        h, w = img_np.shape[:2]
                     except Exception:
                         continue
 
-                    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-                        tmp_path = tmp.name
-                        img_pil.save(tmp_path, "JPEG", quality=95)
-
-                    try:
-                        results = model(tmp_path, verbose=False, conf=conf, imgsz=640)
-                    except Exception:
-                        results = None
-                    finally:
+                    combined = np.zeros((h, w), dtype=np.uint8)
+                    for m in all_models:
                         try:
-                            os.unlink(tmp_path)
+                            combined = np.maximum(combined,
+                                self._detect_to_mask(m, img_np, conf, target_classes))
                         except Exception:
                             pass
 
-                    if results is None:
-                        continue
-
-                    mask_np = np.zeros((h, w), dtype=np.uint8)
-                    has_applied = False
-                    try:
-                        boxes = results[0].boxes
-                        masks_data = results[0].masks
-                        class_names = results[0].names
-                        if masks_data is not None and len(masks_data) > 0:
-                            seg_masks = masks_data.data.cpu().numpy()
-                            for i in range(len(seg_masks)):
-                                cls_id = int(boxes.cls[i]) if boxes is not None else 0
-                                cls_name = class_names.get(cls_id, str(cls_id))
-                                # 対象クラスフィルタリング（nipplesなど除外クラスをスキップ）
-                                if target_classes and cls_name not in target_classes:
-                                    continue
-                                if float(boxes.conf[i]) >= conf:
-                                    m_f = seg_masks[i]
-                                    m_u8 = (m_f * 255).astype(np.uint8)
-                                    m_res = cv2.resize(m_u8, (w, h), interpolation=cv2.INTER_LINEAR)
-                                    mask_np[m_res > 127] = 255
-                                    has_applied = True
-                        elif boxes is not None and len(boxes) > 0:
-                            for i in range(len(boxes)):
-                                cls_id = int(boxes.cls[i])
-                                cls_name = class_names.get(cls_id, str(cls_id))
-                                # 対象クラスフィルタリング
-                                if target_classes and cls_name not in target_classes:
-                                    continue
-                                if float(boxes.conf[i]) >= conf:
-                                    xyxy = boxes.xyxy[i].tolist()
-                                    bx1, by1, bx2, by2 = xyxy
-                                    if max(abs(bx1), abs(by1), abs(bx2), abs(by2)) <= 1.0:
-                                        bx1, by1 = bx1 * w, by1 * h
-                                        bx2, by2 = bx2 * w, by2 * h
-                                    x1 = max(0, int(min(bx1, bx2)))
-                                    y1 = max(0, int(min(by1, by2)))
-                                    x2 = min(w, int(max(bx1, bx2)))
-                                    y2 = min(h, int(max(by1, by2)))
-                                    mask_np[y1:y2, x1:x2] = 255
-                                    has_applied = True
-                    except Exception:
-                        pass
-
-                    if has_applied and mask_path:
-                        np.savez_compressed(mask_path, mask=mask_np)
+                    if np.any(combined) and mask_path:
+                        np.savez_compressed(mask_path, mask=combined)
                         applied += 1
 
                     self.root.after(0, lambda f=fi: (
