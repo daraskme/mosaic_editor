@@ -12,8 +12,9 @@ SUPPORTED_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 SUPPORTED_VIDEO_EXT = (".mp4", ".avi", ".mov", ".mkv", ".webm")
 ALL_SUPPORTED_EXT = SUPPORTED_EXT + SUPPORTED_VIDEO_EXT
 
-# 追加の固定モデルパス（存在する場合のみ使用）
+# 自動検出で使用する固定モデルパス（存在するものをすべて実行）
 ADDITIONAL_YOLO_MODELS = [
+    r"C:\Users\micro\OneDrive\ドキュメント\mosaic_editor\ntd11_anime_nsfw_segm_v5-variant1.pt",
     r"C:\Users\micro\OneDrive\ドキュメント\mosaic_editor\pussy_yolo11s_bbox_best.pt",
     r"C:\Users\micro\OneDrive\ドキュメント\mosaic_editor\pussy_yolo11s_seg_best.pt",
     r"C:\Users\micro\OneDrive\ドキュメント\mosaic_editor\yoloPenisDetection_v10.pt",
@@ -1262,7 +1263,12 @@ class MosaicEditor:
             messagebox.showwarning("警告", "画像を開いてください")
             return
 
-        model_path = self._get_yolo_model_path()
+        # 固定モデルリストの最初の存在するものをメインモデルとして使用
+        fixed_existing = [p for p in ADDITIONAL_YOLO_MODELS if os.path.isfile(p)]
+        if fixed_existing:
+            model_path = fixed_existing[0]
+        else:
+            model_path = self._get_yolo_model_path()
         if not model_path:
             return
 
@@ -1496,10 +1502,10 @@ class MosaicEditor:
                 import tempfile
 
                 model = YOLO(model_path)
-                # 追加モデルをロード（存在するもののみ）
+                # メインモデル以外の固定モデルをロード
                 extra_models = []
                 for ep in ADDITIONAL_YOLO_MODELS:
-                    if os.path.isfile(ep):
+                    if os.path.isfile(ep) and ep != model_path:
                         try:
                             extra_models.append(YOLO(ep))
                         except Exception:
@@ -2115,11 +2121,14 @@ class MosaicEditor:
             try:
                 from ultralytics import YOLO  # type: ignore
                 import tempfile
-                model = YOLO(model_path)
-                # 追加モデルをロード
+                # 固定モデルリストから最初の存在するものをメインに
+                fixed_existing = [p for p in ADDITIONAL_YOLO_MODELS if os.path.isfile(p)]
+                main_path = fixed_existing[0] if fixed_existing else model_path
+                model = YOLO(main_path)
+                # メイン以外の固定モデルをロード
                 extra_models = []
                 for ep in ADDITIONAL_YOLO_MODELS:
-                    if os.path.isfile(ep):
+                    if os.path.isfile(ep) and ep != main_path:
                         try:
                             extra_models.append(YOLO(ep))
                         except Exception:
