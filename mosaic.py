@@ -14,7 +14,8 @@ ALL_SUPPORTED_EXT = SUPPORTED_EXT + SUPPORTED_VIDEO_EXT
 
 # 自動検出で使用する固定モデルパス（存在するものをすべて実行）
 ADDITIONAL_YOLO_MODELS = [
-    r"C:\Users\micro\OneDrive\ドキュメント\mosaic_editor\ntd11_anime_nsfw_segm_v5-variant1.pt",
+    r"C:\Users\micro\OneDrive\ドキュメント\mosaic_editor\pussy_yolo11s_bbox_best.pt",
+    r"C:\Users\micro\OneDrive\ドキュメント\mosaic_editor\yoloPenisDetection_v10.pt",
 ]
 
 
