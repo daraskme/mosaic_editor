@@ -143,30 +143,68 @@ class MosaicEditor:
             messagebox.showerror("D&Dエラー", str(e))
 
     def _auto_detect_on_dnd(self):
-        """D&D後に4モデルで自動検出してモザイクを適用（確認なし）"""
+        """D&D後に確認ダイアログを出してから4モデルで自動検出（既存マスク上書き）"""
         img_files = [p for p in self.image_list if p.lower().endswith(SUPPORTED_EXT)]
         if not img_files:
             return
         fixed_existing = [p for p in ADDITIONAL_YOLO_MODELS if os.path.isfile(p)]
         if not fixed_existing:
             return
-        conf = getattr(self, '_yolo_conf', 0.5)
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("自動モザイク")
+        dlg.geometry("340x160")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        tk.Label(dlg, text=f"画像 {len(img_files)} 枚に自動モザイクを適用しますか？\n（既存マスクは上書きされます）",
+                 font=("", 9), pady=8).pack()
+
+        conf_frm = tk.Frame(dlg)
+        conf_frm.pack()
+        tk.Label(conf_frm, text="信頼度閾値:").pack(side="left")
+        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.5))
+        tk.Scale(conf_frm, from_=0.1, to=1.0, resolution=0.05,
+                 variable=conf_var, orient=tk.HORIZONTAL, length=180,
+                 showvalue=True).pack(side="left")
+
+        do_run = {"ok": False}
+
+        def on_yes():
+            do_run["ok"] = True
+            dlg.destroy()
+
+        btn_frm = tk.Frame(dlg)
+        btn_frm.pack(pady=8)
+        tk.Button(btn_frm, text="はい", command=on_yes,
+                  bg="#3a7bd5", fg="white", relief="flat",
+                  padx=12, pady=4).pack(side="left", padx=6)
+        tk.Button(btn_frm, text="スキップ", command=dlg.destroy,
+                  relief="flat", padx=8, pady=4).pack(side="left", padx=6)
+
+        dlg.wait_window()
+        if not do_run["ok"]:
+            return
+
+        self._yolo_conf = conf_var.get()
+        conf = self._yolo_conf
         target_classes = getattr(self, '_batch_target_classes', None)
         if target_classes:
             target_classes = [c for c, v in target_classes.items() if v]
         else:
             target_classes = None
+
         try:
             import ultralytics  # type: ignore  # noqa: F401
             self._auto_detect_folder_batch(fixed_existing[0], img_files, conf,
-                                           overwrite=False, target_classes=target_classes)
+                                           overwrite=True, target_classes=target_classes)
         except ImportError:
             if messagebox.askyesno(
                 "ultralytics 自動インストール",
                 "ultralytics がインストールされていません。\n自動的にインストールしますか？"
             ):
                 self._install_and_folder_batch(fixed_existing[0], img_files, conf,
-                                               False, target_classes)
+                                               True, target_classes)
 
     # ================= 座標変換 =================
 
