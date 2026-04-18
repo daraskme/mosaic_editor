@@ -14,8 +14,7 @@ ALL_SUPPORTED_EXT = SUPPORTED_EXT + SUPPORTED_VIDEO_EXT
 
 # 自動検出で使用する固定モデルパス（存在するものをすべて実行）
 ADDITIONAL_YOLO_MODELS = [
-    r"C:\Users\micro\OneDrive\ドキュメント\mosaic_editor\pussy_yolo11s_bbox_best.pt",
-    r"C:\Users\micro\OneDrive\ドキュメント\mosaic_editor\yoloPenisDetection_v10.pt",
+    r"C:\Users\micro\OneDrive\ドキュメント\mosaic_editor\ntd11_anime_nsfw_segm_v5-variant1.pt",
 ]
 
 
@@ -151,7 +150,7 @@ class MosaicEditor:
 
         dlg = tk.Toplevel(self.root)
         dlg.title("自動モザイク")
-        dlg.geometry("340x160")
+        dlg.geometry("360x290")
         dlg.resizable(False, False)
         dlg.grab_set()
 
@@ -165,6 +164,27 @@ class MosaicEditor:
         tk.Scale(conf_frm, from_=0.1, to=1.0, resolution=0.05,
                  variable=conf_var, orient=tk.HORIZONTAL, length=180,
                  showvalue=True).pack(side="left")
+
+        # 対象クラス選択
+        tk.Label(dlg, text="検出対象クラス:", font=("", 9)).pack(pady=(6, 0))
+        cls_frm = tk.Frame(dlg)
+        cls_frm.pack(pady=2)
+        _default_classes = {
+            "nipples": False, "pussy": True, "anus": True, "penis": True,
+            "testicles": True, "x-ray": True, "cross-section": True
+        }
+        if not hasattr(self, '_batch_target_classes'):
+            self._batch_target_classes = dict(_default_classes)
+        cls_vars = {}
+        row, col = 0, 0
+        for cname in _default_classes:
+            var = tk.BooleanVar(value=self._batch_target_classes.get(cname, _default_classes[cname]))
+            cls_vars[cname] = var
+            tk.Checkbutton(cls_frm, text=cname, variable=var).grid(row=row, column=col, sticky="w", padx=4)
+            col += 1
+            if col > 2:
+                col = 0
+                row += 1
 
         do_run = {"ok": False}
 
@@ -186,11 +206,9 @@ class MosaicEditor:
 
         self._yolo_conf = conf_var.get()
         conf = self._yolo_conf
-        target_classes = getattr(self, '_batch_target_classes', None)
-        if target_classes:
-            target_classes = [c for c, v in target_classes.items() if v]
-        else:
-            target_classes = None
+        for cname in self._batch_target_classes:
+            self._batch_target_classes[cname] = cls_vars[cname].get()
+        target_classes = [c for c, v in cls_vars.items() if v.get()] or None
 
         try:
             import ultralytics  # type: ignore  # noqa: F401
