@@ -68,6 +68,20 @@ class MosaicEditor:
         self.rect_start_x = None
         self.rect_start_y = None
 
+        # 選択ペン (wand drag) 用キャッシュ・スロットリング
+        self._wand_img_bgr_cache: Optional[np.ndarray] = None
+        self._wand_last_ix: int = -9999
+        self._wand_last_iy: int = -9999
+
+        # ペン/消しゴム ストローク補間用
+        self._pen_last_ix: Optional[int] = None
+        self._pen_last_iy: Optional[int] = None
+
+        # YOLO 推論エラー収集
+        self._yolo_last_errors: List[str] = []
+        # YOLO モデルキャッシュ（ロード済みインスタンスを再利用）
+        self._yolo_model_cache: dict = {}
+
         self.canvas = tk.Canvas(self.root, cursor="crosshair", bg="gray")
 
         self.build_menu()
@@ -160,7 +174,7 @@ class MosaicEditor:
         conf_frm = tk.Frame(dlg)
         conf_frm.pack()
         tk.Label(conf_frm, text="信頼度閾値:").pack(side="left")
-        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.3))
+        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.5))
         tk.Scale(conf_frm, from_=0.1, to=1.0, resolution=0.05,
                  variable=conf_var, orient=tk.HORIZONTAL, length=180,
                  showvalue=True).pack(side="left")
@@ -382,10 +396,13 @@ class MosaicEditor:
             self.canvas.bind("<ButtonRelease-1>", self.on_release)
             self.canvas.bind("<Motion>", self.on_mouse_move)
 
-            # マウスホイールズーム (Windows: <MouseWheel>, Linux: <Button-4>/<Button-5>)
+            # マウスホイール (Windows: <MouseWheel>, Linux: <Button-4>/<Button-5>)
+            # ホイール単体 → 前後の画像/フレーム移動、Ctrl+ホイール → 拡大縮小
             self.canvas.bind("<MouseWheel>", self.on_mousewheel)
-            self.canvas.bind("<Button-4>", lambda e: self._zoom_at(e, 1.1))
-            self.canvas.bind("<Button-5>", lambda e: self._zoom_at(e, 1 / 1.1))
+            self.canvas.bind("<Button-4>", lambda e: self._navigate_image_or_frame(e, -1))
+            self.canvas.bind("<Button-5>", lambda e: self._navigate_image_or_frame(e, 1))
+            self.canvas.bind("<Control-Button-4>", lambda e: self._zoom_at(e, 1.1))
+            self.canvas.bind("<Control-Button-5>", lambda e: self._zoom_at(e, 1 / 1.1))
 
             self.canvas.bind("<ButtonPress-2>", self.start_pan)
             self.canvas.bind("<B2-Motion>", self.do_pan)
@@ -432,14 +449,23 @@ class MosaicEditor:
         self.zoom = min(canvas_w / img_w, canvas_h / img_h)
 
     def on_mousewheel(self, event):
-        """Windowsマウスホイール: 動画時はフレーム移動、画像時はズーム（Ctrl+ホイールは常にズーム）"""
+        """ホイール単体 → 前後の画像/フレーム移動、Ctrl+ホイール → 拡大縮小"""
         ctrl = (event.state & 0x4) != 0
-        if self.is_video and not ctrl:
-            # フレーム移動: ホイール下 = 次フレーム、ホイール上 = 前フレーム
-            self._navigate_frame(1 if event.delta < 0 else -1)
-        else:
+        if ctrl:
             factor = 1.1 if event.delta > 0 else 1 / 1.1
             self._zoom_at(event, factor)
+        else:
+            self._navigate_image_or_frame(event, -1 if event.delta > 0 else 1)
+
+    def _navigate_image_or_frame(self, event, delta: int):
+        """delta=-1 で前へ、delta=1 で次へ移動（動画はフレーム、画像はファイル）"""
+        if self.is_video:
+            self._navigate_frame(delta)
+        else:
+            if delta < 0:
+                self.prev_image()
+            else:
+                self.next_image()
 
     def _zoom_at(self, event, factor):
         """マウスカーソル位置を中心にズーム"""
@@ -557,8 +583,10 @@ class MosaicEditor:
         color = "green"
         if self.mode.get() == "eraser":
             color = "white"
+        elif self.mode.get() == "wand":
+            color = "cyan"
 
-        if self.mode.get() not in ("rect", "wand"):
+        if self.mode.get() != "rect":
             self.canvas.create_oval(
                 cx - r, cy - r, cx + r, cy + r,
                 outline=color, width=2, tags=self.cursor_tag
@@ -572,11 +600,18 @@ class MosaicEditor:
 
         if self.mode.get() == "wand":
             self.start_stroke()
+            # ドラッグ中に使う BGR キャッシュをここで作成
+            img_np = np.array(self.original_image)
+            self._wand_img_bgr_cache = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+            self._wand_last_ix = ix
+            self._wand_last_iy = iy
             self.apply_wand_flood(ix, iy)
         elif self.mode.get() == "rect":
             self.rect_start_x, self.rect_start_y = ix, iy
         else:
             self.start_stroke()
+            self._pen_last_ix = ix
+            self._pen_last_iy = iy
             self.apply_brush(ix, iy)
 
     def on_drag(self, event):
@@ -587,9 +622,18 @@ class MosaicEditor:
         ix, iy = self.canvas_to_image(event.x, event.y)
 
         if self.mode.get() in ("pen", "eraser"):
-            self.apply_brush(ix, iy)
+            self.apply_brush(ix, iy, self._pen_last_ix, self._pen_last_iy)
+            self._pen_last_ix = ix
+            self._pen_last_iy = iy
         elif self.mode.get() == "wand":
-            self.apply_wand_flood(ix, iy)
+            # 距離ベースのスロットリング: ブラシサイズの半分以上動いた場合だけ処理
+            min_dist = max(3, self.brush_size.get() // 3)
+            dx = ix - self._wand_last_ix
+            dy = iy - self._wand_last_iy
+            if dx * dx + dy * dy >= min_dist * min_dist:
+                self._wand_last_ix = ix
+                self._wand_last_iy = iy
+                self.apply_wand_flood(ix, iy)
         elif self.mode.get() == "rect":
             if self.rect_start_x is not None and self.rect_start_y is not None:
                 self.canvas.delete(self.preview_rect_tag)
@@ -603,6 +647,9 @@ class MosaicEditor:
                 )
 
     def on_release(self, event):
+        if self.mode.get() == "wand":
+            self._wand_img_bgr_cache = None
+
         if self.mode.get() == "rect":
             if self.rect_start_x is not None and self.rect_start_y is not None:
                 ix, iy = self.canvas_to_image(event.x, event.y)
@@ -636,12 +683,17 @@ class MosaicEditor:
         if self.original_image is None or self.mosaic_mask is None:
             return
 
-        img_np = np.array(self.original_image)
-        h, w = img_np.shape[:2]
+        # キャッシュがあれば再利用してコスト削減
+        if self._wand_img_bgr_cache is not None:
+            img_bgr = self._wand_img_bgr_cache
+            h, w = img_bgr.shape[:2]
+        else:
+            img_np = np.array(self.original_image)
+            h, w = img_np.shape[:2]
+            img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
         if x < 0 or x >= w or y < 0 or y >= h:
             return
-
-        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
         tol = self.threshold.get()
 
         mask = np.zeros((h + 2, w + 2), np.uint8)
@@ -650,7 +702,8 @@ class MosaicEditor:
         flags = connectivity | (255 << 8) | cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE
 
         if self.use_edge_detection.get():
-            gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+            # BGR からグレースケールへ変換（img_np が未定義でも動作する）
+            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             edges = cv2.Canny(gray, 100, 200)
             kernel_edge = np.ones((3, 3), np.uint8)
             edges_dilated = cv2.dilate(edges, kernel_edge, iterations=1)
@@ -669,6 +722,12 @@ class MosaicEditor:
         flood_mask_closed = cv2.morphologyEx(flood_mask, cv2.MORPH_CLOSE, kernel)
         flood_mask_bool = flood_mask_closed.astype(bool)
 
+        # ブラシサイズの円内に flood fill 結果を限定する
+        r = self.brush_size.get()
+        brush_limit = np.zeros((h, w), dtype=np.uint8)
+        cv2.circle(brush_limit, (x, y), r, 255, -1)
+        flood_mask_bool = flood_mask_bool & (brush_limit > 0)
+
         m_mask = self.mosaic_mask
         if m_mask is not None:
             if hasattr(self, 'selection_rect') and self.selection_rect is not None:
@@ -684,27 +743,31 @@ class MosaicEditor:
 
     # ================= Pen / Brush =================
 
-    def apply_brush(self, x, y):
+    def apply_brush(self, x, y, prev_x=None, prev_y=None):
         m_mask = self.mosaic_mask
         if m_mask is None:
             return
 
-        h, w = m_mask.shape[:2]
         r = self.brush_size.get()
-
-        color = 255
-        if self.mode.get() == "eraser":
-            color = 0
+        color = 0 if self.mode.get() == "eraser" else 255
 
         if hasattr(self, 'selection_rect') and self.selection_rect is not None:
             temp_mask = m_mask.copy()
-            cv2.circle(temp_mask, (x, y), r, (color,), -1)
+            self._draw_brush_segment(temp_mask, prev_x, prev_y, x, y, r, color)
             sx1, sy1, sx2, sy2 = self.selection_rect
             m_mask[sy1:sy2, sx1:sx2] = temp_mask[sy1:sy2, sx1:sx2]
         else:
-            cv2.circle(m_mask, (x, y), r, (color,), -1)
+            self._draw_brush_segment(m_mask, prev_x, prev_y, x, y, r, color)
 
         self.update_view()
+
+    def _draw_brush_segment(self, mask, x0, y0, x1, y1, r, color):
+        """前回位置 (x0,y0) から現在位置 (x1,y1) まで円ブラシで連続描画する。"""
+        if x0 is not None and y0 is not None and (x0 != x1 or y0 != y1):
+            # 太い線で隙間を埋め、両端に丸をつける
+            cv2.line(mask, (x0, y0), (x1, y1), (color,), r * 2)
+            cv2.circle(mask, (x0, y0), r, (color,), -1)
+        cv2.circle(mask, (x1, y1), r, (color,), -1)
 
     def start_stroke(self):
         self.push_history()
@@ -1361,7 +1424,7 @@ class MosaicEditor:
 
         tk.Label(conf_win, text="信頼度スコア閾値 (推奨: 0.5〜0.8)",
                  font=("", 9)).pack(pady=(8, 0))
-        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.3))
+        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.5))
         conf_scale = tk.Scale(conf_win, from_=0.1, to=1.0, resolution=0.05,
                               variable=conf_var, orient=tk.HORIZONTAL, length=260,
                               showvalue=True)
@@ -1579,15 +1642,13 @@ class MosaicEditor:
 
         def detect_worker():
             try:
-                from ultralytics import YOLO  # type: ignore
-
-                model = YOLO(model_path)
-                # メインモデル以外の固定モデルをロード
+                # キャッシュ済みモデルを使用（初回のみディスクからロード）
+                model = self._get_cached_yolo(model_path)
                 extra_models = []
                 for ep in ADDITIONAL_YOLO_MODELS:
                     if os.path.isfile(ep) and ep != model_path:
                         try:
-                            extra_models.append(YOLO(ep))
+                            extra_models.append(self._get_cached_yolo(ep))
                         except Exception:
                             pass
                 all_models = [model] + extra_models
@@ -1905,82 +1966,126 @@ class MosaicEditor:
             pass
         messagebox.showerror("YOLO エラー", f"検出中にエラーが発生しました:\n{err}")
 
+    # ── モデルキャッシュ ────────────────────────────────────────
+
+    def _get_cached_yolo(self, model_path: str):
+        """YOLOモデルをキャッシュして再ロードのコストを省く。"""
+        if model_path not in self._yolo_model_cache:
+            from ultralytics import YOLO  # type: ignore
+            m = YOLO(model_path)
+            self._yolo_model_cache[model_path] = m
+        return self._yolo_model_cache[model_path]
+
     # ── タイリング推論ヘルパー ──────────────────────────────────
 
     def _detect_to_mask(self, model, img_np: np.ndarray, conf: float,
-                        target_classes, tile_size: int = 640) -> np.ndarray:
-        """1モデル・1画像で推論。大きい画像はタイリング対応。マスク(H,W uint8)を返す。"""
+                        target_classes, tile_size: int = 1024) -> np.ndarray:
+        """1モデル・1画像で推論。大きい画像はタイルをバッチ推論。マスク(H,W uint8)を返す。"""
         h, w = img_np.shape[:2]
         mask = np.zeros((h, w), dtype=np.uint8)
+        self._yolo_last_errors = []
 
-        def _apply_res(res, ox: int, oy: int, tw: int, th: int):
+        # GPU が使えるなら FP16 で速度向上
+        try:
+            import torch
+            use_half = torch.cuda.is_available()
+        except Exception:
+            use_half = False
+
+        def _draw_polygon(pts, ox, oy):
+            if len(pts) < 3:
+                return
+            pts_f = pts.astype(np.float32).copy()
+            pts_f[:, 0] = np.clip(pts_f[:, 0] + ox, 0, w - 1)
+            pts_f[:, 1] = np.clip(pts_f[:, 1] + oy, 0, h - 1)
+            pts_cv = pts_f.astype(np.int32).reshape((-1, 1, 2))
+            cv2.fillPoly(mask, [pts_cv], 255)
+
+        def _apply_single(result, ox: int, oy: int):
+            """単一 Result オブジェクトをマスクに描画する。"""
             try:
-                boxes = res[0].boxes
-                mdata = res[0].masks
-                names = res[0].names
-                if mdata is not None and len(mdata) > 0:
-                    segs = mdata.data.cpu().numpy()
-                    for i in range(len(segs)):
-                        cid = int(boxes.cls[i]) if boxes is not None else 0
-                        cname = names.get(cid, str(cid))
-                        if target_classes and cname not in target_classes:
+                boxes = result.boxes
+                mdata = result.masks
+                names = result.names
+            except Exception as e:
+                self._yolo_last_errors.append(f"結果取得エラー: {e}")
+                return
+
+            if mdata is not None and len(mdata) > 0:
+                try:
+                    polygons = mdata.xy
+                except Exception as e:
+                    self._yolo_last_errors.append(f"mdata.xy エラー: {e}")
+                    polygons = []
+                for i, pts in enumerate(polygons):
+                    try:
+                        if boxes is None or i >= len(boxes):
                             continue
-                        if float(boxes.conf[i]) >= conf:
-                            mf = segs[i]
-                            mu8 = (mf * 255).astype(np.uint8)
-                            mres = cv2.resize(mu8, (tw, th), interpolation=cv2.INTER_LINEAR)
-                            mask[oy:oy+th, ox:ox+tw] = np.maximum(
-                                mask[oy:oy+th, ox:ox+tw], mres)
-                elif boxes is not None and len(boxes) > 0:
-                    for i in range(len(boxes)):
                         cid = int(boxes.cls[i])
                         cname = names.get(cid, str(cid))
                         if target_classes and cname not in target_classes:
                             continue
-                        if float(boxes.conf[i]) >= conf:
-                            xy = boxes.xyxy[i].tolist()
-                            bx1, by1, bx2, by2 = xy
-                            if max(abs(bx1), abs(by1), abs(bx2), abs(by2)) <= 1.0:
-                                bx1, by1 = bx1 * tw, by1 * th
-                                bx2, by2 = bx2 * tw, by2 * th
-                            x1 = ox + max(0, int(min(bx1, bx2)))
-                            y1 = oy + max(0, int(min(by1, by2)))
-                            x2 = ox + min(tw, int(max(bx1, bx2)))
-                            y2 = oy + min(th, int(max(by1, by2)))
-                            x1 = max(0, min(w, x1)); y1 = max(0, min(h, y1))
-                            x2 = max(0, min(w, x2)); y2 = max(0, min(h, y2))
-                            if x2 > x1 and y2 > y1:
-                                mask[y1:y2, x1:x2] = 255
-            except Exception:
-                pass
+                        if float(boxes.conf[i]) < conf:
+                            continue
+                        _draw_polygon(pts, ox, oy)
+                    except Exception as e:
+                        self._yolo_last_errors.append(f"polygon[{i}]: {e}")
+            elif boxes is not None and len(boxes) > 0:
+                for i in range(len(boxes)):
+                    try:
+                        cid = int(boxes.cls[i])
+                        cname = names.get(cid, str(cid))
+                        if target_classes and cname not in target_classes:
+                            continue
+                        if float(boxes.conf[i]) < conf:
+                            continue
+                        bx1, by1, bx2, by2 = boxes.xyxy[i].tolist()
+                        x1 = max(0, min(w, ox + int(min(bx1, bx2))))
+                        y1 = max(0, min(h, oy + int(min(by1, by2))))
+                        x2 = max(0, min(w, ox + int(max(bx1, bx2))))
+                        y2 = max(0, min(h, oy + int(max(by1, by2))))
+                        if x2 > x1 and y2 > y1:
+                            mask[y1:y2, x1:x2] = 255
+                    except Exception as e:
+                        self._yolo_last_errors.append(f"bbox[{i}]: {e}")
 
+        infer_imgsz = 1024
         long_side = max(w, h)
-        # 長辺に合わせた imgsz（最大1280、32の倍数）
-        imgsz = min(long_side, 1280)
-        imgsz = max(32, (imgsz // 32) * 32)
+        infer_kwargs = dict(verbose=False, conf=conf, imgsz=infer_imgsz, half=use_half)
 
         if long_side <= tile_size * 1.5:
+            # 画像全体を1回で推論
             try:
-                res = model(img_np, verbose=False, conf=conf, imgsz=imgsz)
-                _apply_res(res, 0, 0, w, h)
-            except Exception:
-                pass
+                results = model(img_np, **infer_kwargs)
+                _apply_single(results[0], 0, 0)
+            except Exception as e:
+                self._yolo_last_errors.append(f"推論エラー: {e}")
         else:
-            # タイリング（オーバーラップ25%）
+            # タイルをまとめてバッチ推論（1回のフォワードパスで処理）
             stride = int(tile_size * 0.75)
+            tiles: list = []
+            coords: list = []
             for ty in range(0, h, stride):
                 for tx in range(0, w, stride):
                     tx2 = min(tx + tile_size, w)
                     ty2 = min(ty + tile_size, h)
                     tx1 = max(0, tx2 - tile_size)
                     ty1 = max(0, ty2 - tile_size)
-                    tile = img_np[ty1:ty2, tx1:tx2]
-                    th_t, tw_t = tile.shape[:2]
-                    try:
-                        res = model(tile, verbose=False, conf=conf, imgsz=tile_size)
-                        _apply_res(res, tx1, ty1, tw_t, th_t)
-                    except Exception:
-                        pass
+                    tiles.append(img_np[ty1:ty2, tx1:tx2])
+                    coords.append((tx1, ty1))
+
+            # GPU VRAM を考慮して最大4枚ずつバッチ処理
+            batch_size = 4
+            for b in range(0, len(tiles), batch_size):
+                batch = tiles[b:b + batch_size]
+                bcoords = coords[b:b + batch_size]
+                try:
+                    results = model(batch, **infer_kwargs)
+                    for result, (ox, oy) in zip(results, bcoords):
+                        _apply_single(result, ox, oy)
+                except Exception as e:
+                    self._yolo_last_errors.append(f"バッチ推論エラー: {e}")
+
         return mask
 
     def _apply_combined_mask(self, wait_win, combined_mask: np.ndarray):
@@ -1992,7 +2097,16 @@ class MosaicEditor:
         if self.mosaic_mask is None:
             return
         if not np.any(combined_mask):
-            messagebox.showinfo("自動検出", "検出結果が見つかりませんでした。\n閾値を下げてみてください。")
+            errors = getattr(self, '_yolo_last_errors', [])
+            error_detail = ""
+            if errors:
+                error_detail = "\n\n--- エラー詳細 ---\n" + "\n".join(errors[:5])
+            messagebox.showinfo(
+                "自動検出",
+                f"検出結果が見つかりませんでした。\n"
+                f"・閾値を下げてみてください（現在の推奨: 0.5〜0.8）\n"
+                f"・対象クラスが選択されているか確認してください{error_detail}"
+            )
             return
         self.mosaic_mask = np.maximum(self.mosaic_mask, combined_mask)
         self.show_mask.set(True)
@@ -2037,7 +2151,7 @@ class MosaicEditor:
                  font=("", 8), fg="gray").pack()
 
         tk.Label(conf_dlg, text="信頼度閾値:", font=("", 9)).pack(pady=(6, 0))
-        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.3))
+        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.5))
         tk.Scale(conf_dlg, from_=0.1, to=1.0, resolution=0.05,
                  variable=conf_var, orient=tk.HORIZONTAL, length=260,
                  showvalue=True).pack()
@@ -2191,20 +2305,18 @@ class MosaicEditor:
 
         def worker():
             try:
-                from ultralytics import YOLO  # type: ignore
-                import tempfile
-                # 固定モデルリストから全モデルをロード
+                # キャッシュ済みモデルを使用（初回のみディスクからロード）
                 fixed_existing = [p for p in ADDITIONAL_YOLO_MODELS if os.path.isfile(p)]
                 main_path = fixed_existing[0] if fixed_existing else model_path
                 all_models = []
                 for ep in ([main_path] + [p for p in ADDITIONAL_YOLO_MODELS
                                           if os.path.isfile(p) and p != main_path]):
                     try:
-                        all_models.append(YOLO(ep))
+                        all_models.append(self._get_cached_yolo(ep))
                     except Exception:
                         pass
                 if not all_models:
-                    all_models = [YOLO(model_path)]
+                    all_models = [self._get_cached_yolo(model_path)]
                 applied = 0
 
                 for fi, img_path in enumerate(img_files):
