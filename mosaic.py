@@ -60,6 +60,8 @@ class MosaicEditor:
         self._canvas_yview: float = 0.0
 
         self.mosaic_mask: Optional[np.ndarray] = None
+        self._skip_jpg_set: set = set()  # mcフォルダへのJPEG作成をスキップするパスのセット
+        self._skip_btn: Optional[tk.Button] = None  # 「作成しない」ボタンへの参照
 
         self.cursor_tag = "cursor_preview"
         self.preview_rect_tag = "preview_rect"
@@ -251,8 +253,70 @@ class MosaicEditor:
         """画像に対応するマスクNPZファイルのパスを返す"""
         if self.output_folder is None:
             return ""
+        masks_dir = os.path.join(self.output_folder, "masks")
+        os.makedirs(masks_dir, exist_ok=True)
         base = os.path.splitext(os.path.basename(img_path))[0]
-        return os.path.join(self.output_folder, base + ".mask.npz")
+        return os.path.join(masks_dir, base + ".mask.npz")
+
+    def get_skip_marker_path(self, img_path: str) -> str:
+        """画像に対応するスキップマーカーファイルのパスを返す"""
+        if self.output_folder is None:
+            return ""
+        masks_dir = os.path.join(self.output_folder, "masks")
+        os.makedirs(masks_dir, exist_ok=True)
+        base = os.path.splitext(os.path.basename(img_path))[0]
+        return os.path.join(masks_dir, base + ".skip")
+
+    def is_skip_jpg(self, img_path: Optional[str] = None) -> bool:
+        """現在の画像（またはimg_path）がJPEG作成スキップ対象かどうか"""
+        path = img_path or self.current_path
+        return path in self._skip_jpg_set if path else False
+
+    def toggle_skip_jpg(self):
+        """現在の画像のJPEG作成スキップ状態をトグルする"""
+        path = self.current_path
+        if path is None:
+            return
+        if path in self._skip_jpg_set:
+            # スキップ解除
+            self._skip_jpg_set.discard(path)
+            marker = self.get_skip_marker_path(path)
+            if marker and os.path.exists(marker):
+                try:
+                    os.remove(marker)
+                except Exception:
+                    pass
+        else:
+            # スキップ設定：既存JPEGを削除してマーカー保存
+            self._skip_jpg_set.add(path)
+            marker = self.get_skip_marker_path(path)
+            if marker:
+                try:
+                    open(marker, "w").close()
+                except Exception:
+                    pass
+            # 既存のJPEGをmcフォルダから削除
+            if self.output_folder:
+                base_name = os.path.splitext(os.path.basename(path))[0]
+                jpg_path = os.path.join(self.output_folder, base_name + ".jpg")
+                if os.path.exists(jpg_path):
+                    try:
+                        os.remove(jpg_path)
+                    except Exception:
+                        pass
+        self._update_skip_btn()
+        self.update_view()
+
+    def _update_skip_btn(self):
+        """「作成しない」ボタンの見た目を現在のスキップ状態に合わせて更新する"""
+        if self._skip_btn is None:
+            return
+        if self.is_skip_jpg():
+            self._skip_btn.config(bg="#cc2222", fg="white", relief="sunken",
+                                  text="✕ 作成しない")
+        else:
+            self._skip_btn.config(bg="#555555", fg="white", relief="flat",
+                                  text="作成しない")
 
     def get_block_size(self, img_w: int = 0, img_h: int = 0) -> int:
         """ブロックサイズを取得。自動モード時は視親規定に基づく計算。
@@ -330,6 +394,11 @@ class MosaicEditor:
 
         tk.Button(top, text="自動検出 (YOLO)", command=self.auto_detect_yolo,
                   bg="#4a90d9", fg="white", relief="flat", padx=6).pack(side="left", padx=(10, 0))
+
+        # 「作成しない」トグルボタン
+        self._skip_btn = tk.Button(top, text="作成しない", command=self.toggle_skip_jpg,
+                                   bg="#555555", fg="white", relief="flat", padx=6)
+        self._skip_btn.pack(side="left", padx=(10, 0))
 
         # フレームナビラベル（動画時のみ使用）
         self.frame_label = tk.Label(top, text="", font=("Consolas", 9), fg="#555")
@@ -945,6 +1014,13 @@ class MosaicEditor:
         self.clear_selection()
         self._canvas_xview = 0.0
         self._canvas_yview = 0.0
+        # スキップマーカーを確認してセットとボタンを更新
+        skip_marker = self.get_skip_marker_path(path)
+        if skip_marker and os.path.exists(skip_marker):
+            self._skip_jpg_set.add(path)
+        else:
+            self._skip_jpg_set.discard(path)
+        self._update_skip_btn()
         self._zoom_to_fit()
         self.update_view()
         self.root.title(
@@ -973,6 +1049,9 @@ class MosaicEditor:
         self.clear_selection()
         self._canvas_xview = 0.0
         self._canvas_yview = 0.0
+        # 動画では「作成しない」ボタンをリセット
+        self._skip_jpg_set.discard(path)
+        self._update_skip_btn()
         self.root.title(
             f"Mosaic Editor [VIDEO] - {os.path.basename(path)} ({self.current_index + 1}/{len(self.image_list)})"
         )
@@ -1023,11 +1102,6 @@ class MosaicEditor:
             return
 
         # 画像モードの保存
-        clean_np = self.generate_mosaic_image()
-        if clean_np is None:
-            return
-
-        img_to_save = Image.fromarray(clean_np)
         path = self.current_path
         folder = self.output_folder
 
@@ -1036,7 +1110,28 @@ class MosaicEditor:
         save_filename = base_name + ".jpg"
         save_path = os.path.join(folder, save_filename)
 
-        # JPEG形式で保存（品質95）
+        if self.is_skip_jpg(path):
+            # 「作成しない」が設定されている場合はJPEGを生成しない（既存があれば削除）
+            if os.path.exists(save_path):
+                try:
+                    os.remove(save_path)
+                except Exception:
+                    pass
+            # マスクも保存しない（既存マスクは削除）
+            mask_path = self.get_mask_path(path)
+            if mask_path and os.path.exists(mask_path):
+                try:
+                    os.remove(mask_path)
+                except Exception:
+                    pass
+            return
+
+        # 通常保存: JPEG生成
+        clean_np = self.generate_mosaic_image()
+        if clean_np is None:
+            return
+
+        img_to_save = Image.fromarray(clean_np)
         img_to_save.save(save_path, "JPEG", quality=95)
 
         # マスクをNPZに保存（空ならファイル削除）
@@ -1318,6 +1413,18 @@ class MosaicEditor:
                 x1 * self.zoom, y1 * self.zoom, x2 * self.zoom, y2 * self.zoom,
                 outline="red", width=2, dash=(4, 4), tags=self.selection_tag
             )
+
+        # スキップ中の画像には大きな赤バツを表示
+        if self.is_skip_jpg():
+            margin = 20
+            self.canvas.create_line(margin, margin, new_w - margin, new_h - margin,
+                                    fill="#ff0000", width=8, tags="skip_x")
+            self.canvas.create_line(new_w - margin, margin, margin, new_h - margin,
+                                    fill="#ff0000", width=8, tags="skip_x")
+            self.canvas.create_text(new_w // 2, new_h // 2,
+                                    text="作成しない", fill="#ff0000",
+                                    font=("", max(14, new_h // 12), "bold"),
+                                    tags="skip_x")
 
     def next_image(self):
         if self.is_video:
