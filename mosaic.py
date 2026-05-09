@@ -44,12 +44,12 @@ class MosaicEditor:
         # Mode: pen, wand, eraser, rect
         self.mode = tk.StringVar(value="pen")
         self.threshold = tk.IntVar(value=40)
-        self.brush_size = tk.IntVar(value=40)
+        self.pen_brush_size = tk.IntVar(value=40)
+        self.wand_brush_size = tk.IntVar(value=40)
         self.mosaic_size = tk.IntVar(value=10)
         self.mosaic_size.trace_add("write", self.on_mosaic_size_change)
         self.auto_mosaic = tk.BooleanVar(value=True)  # 規定準拠自動サイズ
         self.show_mask = tk.BooleanVar(value=True)
-        self.use_edge_detection = tk.BooleanVar(value=False)
 
         self.undo_stack: List[np.ndarray] = []
         self.redo_stack: List[np.ndarray] = []
@@ -148,95 +148,8 @@ class MosaicEditor:
             self.image_list = all_files
             self.current_index = 0
             self.load_current_file()
-            # D&D後に画像ファイルがあれば自動検出を実行（確認なし）
-            img_files = [p for p in all_files if p.lower().endswith(SUPPORTED_EXT)]
-            if img_files:
-                self.root.after(300, self._auto_detect_on_dnd)
         except Exception as e:
             messagebox.showerror("D&Dエラー", str(e))
-
-    def _auto_detect_on_dnd(self):
-        """D&D後に確認ダイアログを出してから4モデルで自動検出（既存マスク上書き）"""
-        img_files = [p for p in self.image_list if p.lower().endswith(SUPPORTED_EXT)]
-        if not img_files:
-            return
-        fixed_existing = [p for p in ADDITIONAL_YOLO_MODELS if os.path.isfile(p)]
-        if not fixed_existing:
-            return
-
-        dlg = tk.Toplevel(self.root)
-        dlg.title("自動モザイク")
-        dlg.geometry("360x290")
-        dlg.resizable(False, False)
-        dlg.grab_set()
-
-        tk.Label(dlg, text=f"画像 {len(img_files)} 枚に自動モザイクを適用しますか？\n（既存マスクは上書きされます）",
-                 font=("", 9), pady=8).pack()
-
-        conf_frm = tk.Frame(dlg)
-        conf_frm.pack()
-        tk.Label(conf_frm, text="信頼度閾値:").pack(side="left")
-        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.5))
-        tk.Scale(conf_frm, from_=0.1, to=1.0, resolution=0.05,
-                 variable=conf_var, orient=tk.HORIZONTAL, length=180,
-                 showvalue=True).pack(side="left")
-
-        # 対象クラス選択
-        tk.Label(dlg, text="検出対象クラス:", font=("", 9)).pack(pady=(6, 0))
-        cls_frm = tk.Frame(dlg)
-        cls_frm.pack(pady=2)
-        _default_classes = {
-            "nipples": False, "pussy": True, "anus": True, "penis": True,
-            "testicles": True, "x-ray": True, "cross-section": True
-        }
-        if not hasattr(self, '_batch_target_classes'):
-            self._batch_target_classes = dict(_default_classes)
-        cls_vars = {}
-        row, col = 0, 0
-        for cname in _default_classes:
-            var = tk.BooleanVar(value=self._batch_target_classes.get(cname, _default_classes[cname]))
-            cls_vars[cname] = var
-            tk.Checkbutton(cls_frm, text=cname, variable=var).grid(row=row, column=col, sticky="w", padx=4)
-            col += 1
-            if col > 2:
-                col = 0
-                row += 1
-
-        do_run = {"ok": False}
-
-        def on_yes():
-            do_run["ok"] = True
-            dlg.destroy()
-
-        btn_frm = tk.Frame(dlg)
-        btn_frm.pack(pady=8)
-        tk.Button(btn_frm, text="はい", command=on_yes,
-                  bg="#3a7bd5", fg="white", relief="flat",
-                  padx=12, pady=4).pack(side="left", padx=6)
-        tk.Button(btn_frm, text="スキップ", command=dlg.destroy,
-                  relief="flat", padx=8, pady=4).pack(side="left", padx=6)
-
-        dlg.wait_window()
-        if not do_run["ok"]:
-            return
-
-        self._yolo_conf = conf_var.get()
-        conf = self._yolo_conf
-        for cname in self._batch_target_classes:
-            self._batch_target_classes[cname] = cls_vars[cname].get()
-        target_classes = [c for c, v in cls_vars.items() if v.get()] or None
-
-        try:
-            import ultralytics  # type: ignore  # noqa: F401
-            self._auto_detect_folder_batch(fixed_existing[0], img_files, conf,
-                                           overwrite=True, target_classes=target_classes)
-        except ImportError:
-            if messagebox.askyesno(
-                "ultralytics 自動インストール",
-                "ultralytics がインストールされていません。\n自動的にインストールしますか？"
-            ):
-                self._install_and_folder_batch(fixed_existing[0], img_files, conf,
-                                               True, target_classes)
 
     # ================= 座標変換 =================
 
@@ -429,14 +342,18 @@ class MosaicEditor:
         tk.Scale(sliders_frame, from_=0, to=255, variable=self.threshold,
                  orient=tk.HORIZONTAL, length=100).grid(row=0, column=1, sticky="w")
 
-        tk.Label(sliders_frame, text="ブラシサイズ").grid(row=0, column=2, sticky="e")
-        tk.Scale(sliders_frame, from_=1, to=200, variable=self.brush_size,
+        tk.Label(sliders_frame, text="ペンサイズ").grid(row=0, column=2, sticky="e")
+        tk.Scale(sliders_frame, from_=1, to=200, variable=self.pen_brush_size,
                  orient=tk.HORIZONTAL, length=100).grid(row=0, column=3, sticky="w")
 
-        tk.Label(sliders_frame, text="モザイク強度").grid(row=0, column=4, sticky="e")
+        tk.Label(sliders_frame, text="魔法の杖サイズ").grid(row=0, column=4, sticky="e")
+        tk.Scale(sliders_frame, from_=1, to=200, variable=self.wand_brush_size,
+                 orient=tk.HORIZONTAL, length=100).grid(row=0, column=5, sticky="w")
+
+        tk.Label(sliders_frame, text="モザイク強度").grid(row=0, column=6, sticky="e")
         self._mosaic_spinbox = tk.Spinbox(sliders_frame, from_=4, to=100, width=5,
                    textvariable=self.mosaic_size)
-        self._mosaic_spinbox.grid(row=0, column=5, sticky="w")
+        self._mosaic_spinbox.grid(row=0, column=7, sticky="w")
 
         def _on_auto_toggle(*_):
             state = "disabled" if self.auto_mosaic.get() else "normal"
@@ -447,15 +364,12 @@ class MosaicEditor:
         _auto_cb = tk.Checkbutton(sliders_frame, text="自動(規定)",
                                   variable=self.auto_mosaic,
                                   command=lambda: _on_auto_toggle())
-        _auto_cb.grid(row=0, column=6, sticky="w", padx=(2, 4))
+        _auto_cb.grid(row=0, column=8, sticky="w", padx=(2, 4))
         # 初期状態を反映
         _on_auto_toggle()
 
         tk.Checkbutton(sliders_frame, text="範囲表示", variable=self.show_mask,
-                       command=self.update_view).grid(row=0, column=7, sticky="w", padx=4)
-
-        tk.Checkbutton(sliders_frame, text="境界線で止める", variable=self.use_edge_detection).grid(
-            row=0, column=8, sticky="w", padx=4)
+                       command=self.update_view).grid(row=0, column=9, sticky="w", padx=4)
 
         if self.canvas is not None:
             self.canvas.pack(fill="both", expand=True)
@@ -647,15 +561,19 @@ class MosaicEditor:
         cx = self.canvas.canvasx(event.x)
         cy = self.canvas.canvasy(event.y)
 
-        r = self.brush_size.get() * self.zoom
+        mode = self.mode.get()
+        if mode == "wand":
+            r = self.wand_brush_size.get() * self.zoom
+        else:
+            r = self.pen_brush_size.get() * self.zoom
 
         color = "green"
-        if self.mode.get() == "eraser":
+        if mode == "eraser":
             color = "white"
-        elif self.mode.get() == "wand":
+        elif mode == "wand":
             color = "cyan"
 
-        if self.mode.get() != "rect":
+        if mode != "rect":
             self.canvas.create_oval(
                 cx - r, cy - r, cx + r, cy + r,
                 outline=color, width=2, tags=self.cursor_tag
@@ -696,7 +614,7 @@ class MosaicEditor:
             self._pen_last_iy = iy
         elif self.mode.get() == "wand":
             # 距離ベースのスロットリング: ブラシサイズの半分以上動いた場合だけ処理
-            min_dist = max(3, self.brush_size.get() // 3)
+            min_dist = max(3, self.wand_brush_size.get() // 3)
             dx = ix - self._wand_last_ix
             dy = iy - self._wand_last_iy
             if dx * dx + dy * dy >= min_dist * min_dist:
@@ -770,20 +688,8 @@ class MosaicEditor:
         connectivity = 8
         flags = connectivity | (255 << 8) | cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE
 
-        if self.use_edge_detection.get():
-            # BGR からグレースケールへ変換（img_np が未定義でも動作する）
-            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            edges = cv2.Canny(gray, 100, 200)
-            kernel_edge = np.ones((3, 3), np.uint8)
-            edges_dilated = cv2.dilate(edges, kernel_edge, iterations=1)
-            mask[1:-1, 1:-1][edges_dilated > 0] = 255
-
-            if mask[y + 1, x + 1] == 0:
-                cv2.floodFill(img_bgr, mask, (x, y), (255, 255, 255),
-                              (tol, tol, tol), (tol, tol, tol), flags)
-        else:
-            cv2.floodFill(img_bgr, mask, (x, y), (255, 255, 255),
-                          (tol, tol, tol), (tol, tol, tol), flags)
+        cv2.floodFill(img_bgr, mask, (x, y), (255, 255, 255),
+                      (tol, tol, tol), (tol, tol, tol), flags)
 
         flood_mask = mask[1:-1, 1:-1]
 
@@ -792,7 +698,7 @@ class MosaicEditor:
         flood_mask_bool = flood_mask_closed.astype(bool)
 
         # ブラシサイズの円内に flood fill 結果を限定する
-        r = self.brush_size.get()
+        r = self.wand_brush_size.get()
         brush_limit = np.zeros((h, w), dtype=np.uint8)
         cv2.circle(brush_limit, (x, y), r, 255, -1)
         flood_mask_bool = flood_mask_bool & (brush_limit > 0)
@@ -817,7 +723,7 @@ class MosaicEditor:
         if m_mask is None:
             return
 
-        r = self.brush_size.get()
+        r = self.pen_brush_size.get()
         color = 0 if self.mode.get() == "eraser" else 255
 
         if hasattr(self, 'selection_rect') and self.selection_rect is not None:
@@ -1741,9 +1647,22 @@ class MosaicEditor:
         if process_all:
             def _cancel():
                 self._yolo_cancel = True
-                wait_win.destroy()
+                try:
+                    wait_win.destroy()
+                except Exception:
+                    pass
             tk.Button(wait_win, text="キャンセル", command=_cancel,
                       relief="flat", padx=8, pady=0).pack(pady=4)
+
+        def _safe_progress(value):
+            # ウィンドウが閉じられた後に呼ばれてもクラッシュしないように
+            try:
+                if not wait_win.winfo_exists():
+                    return
+                bar.config(value=value)
+                pct_label.config(text=f"{value} / {self.video_total_frames}")
+            except Exception:
+                pass
 
         current_img_copy = self.original_image.copy()
 
@@ -1805,11 +1724,8 @@ class MosaicEditor:
                                 self.video_masks[fi] = combined
                             applied_frames += 1
 
-                        if fi % 5 == 0:
-                            self.root.after(0, lambda f=fi: (
-                                bar.config(value=f+1),
-                                pct_label.config(text=f"{f+1} / {total}")
-                            ))
+                        if fi % 5 == 0 or fi == total - 1:
+                            self.root.after(0, lambda f=fi: _safe_progress(f + 1))
 
                     if not self._yolo_cancel:
                         self.root.after(0, lambda: _on_batch_done(applied_frames))
@@ -2405,10 +2321,23 @@ class MosaicEditor:
 
         def _cancel():
             self._batch_cancel = True
-            wait_win.destroy()
+            try:
+                wait_win.destroy()
+            except Exception:
+                pass
 
         tk.Button(wait_win, text="キャンセル", command=_cancel,
                   relief="flat", padx=8, pady=2).pack(pady=4)
+
+        def _safe_progress(value):
+            # キャンセル後にコールバックが残っていてもクラッシュしないように
+            try:
+                if not wait_win.winfo_exists():
+                    return
+                bar.config(value=value)
+                pct_label.config(text=f"{value} / {total}")
+            except Exception:
+                pass
 
         def worker():
             try:
@@ -2423,7 +2352,12 @@ class MosaicEditor:
                     except Exception:
                         pass
                 if not all_models:
-                    all_models = [self._get_cached_yolo(model_path)]
+                    try:
+                        all_models = [self._get_cached_yolo(model_path)]
+                    except Exception as e:
+                        self.root.after(0, lambda emsg=str(e): _on_error(
+                            f"モデル読み込みに失敗しました:\n{emsg}"))
+                        return
                 applied = 0
 
                 for fi, img_path in enumerate(img_files):
@@ -2432,10 +2366,7 @@ class MosaicEditor:
 
                     mask_path = self.get_mask_path(img_path)
                     if not overwrite and mask_path and os.path.exists(mask_path):
-                        self.root.after(0, lambda f=fi: (
-                            bar.config(value=f + 1),
-                            pct_label.config(text=f"{f + 1} / {total}")
-                        ))
+                        self.root.after(0, lambda f=fi: _safe_progress(f + 1))
                         continue
 
                     try:
@@ -2457,10 +2388,7 @@ class MosaicEditor:
                         np.savez_compressed(mask_path, mask=combined)
                         applied += 1
 
-                    self.root.after(0, lambda f=fi: (
-                        bar.config(value=f + 1),
-                        pct_label.config(text=f"{f + 1} / {total}")
-                    ))
+                    self.root.after(0, lambda f=fi: _safe_progress(f + 1))
 
                 self.root.after(0, lambda: _on_done(applied))
 
