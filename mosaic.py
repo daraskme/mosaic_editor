@@ -313,6 +313,25 @@ class MosaicEditor:
                                    bg="#555555", fg="white", relief="flat", padx=6)
         self._skip_btn.pack(side="left", padx=(10, 0))
 
+        # モザイク強度・自動(規定)・範囲表示 を「作成しない」の右側に配置
+        tk.Label(top, text="モザイク強度").pack(side="left", padx=(10, 2))
+        self._mosaic_spinbox = tk.Spinbox(top, from_=4, to=100, width=5,
+                                          textvariable=self.mosaic_size)
+        self._mosaic_spinbox.pack(side="left")
+
+        def _on_auto_toggle(*_):
+            state = "disabled" if self.auto_mosaic.get() else "normal"
+            self._mosaic_spinbox.config(state=state)
+            self.update_view()
+
+        self.auto_mosaic.trace_add("write", _on_auto_toggle)
+        tk.Checkbutton(top, text="自動(規定)", variable=self.auto_mosaic,
+                       command=lambda: _on_auto_toggle()).pack(side="left", padx=(2, 4))
+        tk.Checkbutton(top, text="範囲表示", variable=self.show_mask,
+                       command=self.update_view).pack(side="left", padx=4)
+        # 初期状態を反映
+        _on_auto_toggle()
+
         # フレームナビラベル（動画時のみ使用）
         self.frame_label = tk.Label(top, text="", font=("Consolas", 9), fg="#555")
         self.frame_label.pack(side="right", padx=8)
@@ -349,27 +368,6 @@ class MosaicEditor:
         tk.Label(sliders_frame, text="魔法の杖サイズ").grid(row=0, column=4, sticky="e")
         tk.Scale(sliders_frame, from_=1, to=200, variable=self.wand_brush_size,
                  orient=tk.HORIZONTAL, length=100).grid(row=0, column=5, sticky="w")
-
-        tk.Label(sliders_frame, text="モザイク強度").grid(row=0, column=6, sticky="e")
-        self._mosaic_spinbox = tk.Spinbox(sliders_frame, from_=4, to=100, width=5,
-                   textvariable=self.mosaic_size)
-        self._mosaic_spinbox.grid(row=0, column=7, sticky="w")
-
-        def _on_auto_toggle(*_):
-            state = "disabled" if self.auto_mosaic.get() else "normal"
-            self._mosaic_spinbox.config(state=state)
-            self.update_view()
-
-        self.auto_mosaic.trace_add("write", _on_auto_toggle)
-        _auto_cb = tk.Checkbutton(sliders_frame, text="自動(規定)",
-                                  variable=self.auto_mosaic,
-                                  command=lambda: _on_auto_toggle())
-        _auto_cb.grid(row=0, column=8, sticky="w", padx=(2, 4))
-        # 初期状態を反映
-        _on_auto_toggle()
-
-        tk.Checkbutton(sliders_frame, text="範囲表示", variable=self.show_mask,
-                       command=self.update_view).grid(row=0, column=9, sticky="w", padx=4)
 
         if self.canvas is not None:
             self.canvas.pack(fill="both", expand=True)
