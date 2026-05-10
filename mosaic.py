@@ -1856,15 +1856,17 @@ class MosaicEditor:
 
                 if not process_all:
                     # 単一フレーム：全モデルでタイリング推論 → 合成マスクを直接適用
-                    img_np = np.array(current_img_copy)
-                    ih, iw = img_np.shape[:2]
+                    # PIL は RGB なので ultralytics が期待する BGR (cv2 規約) に変換
+                    img_rgb = np.array(current_img_copy)
+                    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+                    ih, iw = img_bgr.shape[:2]
                     combined = np.zeros((ih, iw), dtype=np.uint8)
                     for m in all_models:
                         if self._yolo_cancel:
                             break
                         try:
                             combined = np.maximum(combined,
-                                self._detect_to_mask(m, img_np, conf, target_classes))
+                                self._detect_to_mask(m, img_bgr, conf, target_classes))
                         except Exception:
                             pass
                     if not self._yolo_cancel:
@@ -1883,12 +1885,12 @@ class MosaicEditor:
                         if not ret:
                             break
 
-                        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                        # cv2 から取得した frame_bgr をそのまま渡す（ultralytics は BGR を期待）
                         combined = np.zeros((h, w), dtype=np.uint8)
                         for m in all_models:
                             try:
                                 combined = np.maximum(combined,
-                                    self._detect_to_mask(m, frame_rgb, conf, target_classes))
+                                    self._detect_to_mask(m, frame_bgr, conf, target_classes))
                             except Exception:
                                 pass
 
@@ -2178,7 +2180,11 @@ class MosaicEditor:
 
     def _detect_to_mask(self, model, img_np: np.ndarray, conf: float,
                         target_classes, tile_size: int = 1024) -> np.ndarray:
-        """1モデル・1画像で推論。大きい画像はタイルをバッチ推論。マスク(H,W uint8)を返す。"""
+        """1モデル・1画像で推論。大きい画像はタイルをバッチ推論。マスク(H,W uint8)を返す。
+
+        img_np は **BGR** (cv2/ultralytics 規約) を期待する。RGB を渡すとチャネル順が
+        ずれて検出精度が大きく低下する。
+        """
         h, w = img_np.shape[:2]
         mask = np.zeros((h, w), dtype=np.uint8)
         self._yolo_last_errors = []
@@ -2608,8 +2614,10 @@ class MosaicEditor:
 
                     try:
                         img_pil = Image.open(img_path).convert("RGB")
-                        img_np = np.array(img_pil)
-                        h, w = img_np.shape[:2]
+                        img_rgb = np.array(img_pil)
+                        # ultralytics は BGR を期待するため変換
+                        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+                        h, w = img_bgr.shape[:2]
                     except Exception:
                         continue
 
@@ -2617,7 +2625,7 @@ class MosaicEditor:
                     for m in all_models:
                         try:
                             combined = np.maximum(combined,
-                                self._detect_to_mask(m, img_np, conf, target_classes))
+                                self._detect_to_mask(m, img_bgr, conf, target_classes))
                         except Exception:
                             pass
 
