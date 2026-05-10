@@ -42,3 +42,10 @@ Thumbs.db
 
 # Specific folders
 civitai/
+
+# COCO YOLO base models (downloaded automatically by ultralytics during testing)
+yolov8n.pt
+yolov8s.pt
+yolov8m.pt
+yolov8l.pt
+yolov8x.pt
