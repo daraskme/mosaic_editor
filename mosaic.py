@@ -106,6 +106,8 @@ class MosaicEditor:
         self._yolo_last_errors: List[str] = []
         # YOLO モデルキャッシュ（ロード済みインスタンスを再利用）
         self._yolo_model_cache: dict = {}
+        # .pt ごとのクラス名リスト（ultralytics ロード前でも参照したい）
+        self._yolo_classnames_cache: dict = {}
 
         self.canvas = tk.Canvas(self.root, cursor="crosshair", bg="gray")
 
@@ -1435,6 +1437,79 @@ class MosaicEditor:
             return path
         return None
 
+    # ── クラス名抽出 ──────────────────────────────────────────
+
+    # 検出対象としてデフォルトでオンにするクラス名（モデル間で共通）
+    # nipples, tits, cum はデフォルトOFFとし、ユーザーが必要なら手動で有効化する
+    _YOLO_DEFAULT_ON_CLASSES = {
+        # wenaka_yolov8s-seg
+        "dick", "vagina", "anus",
+        # ntd11_anime_nsfw_segm_v5
+        "penis", "pussy", "testicles", "x-ray", "cross-section",
+    }
+
+    def _get_class_names_from_pt(self, model_path: str) -> list:
+        """.pt ファイルからクラス名リストを取得。ultralytics 未導入でも torch だけで読む。"""
+        if model_path in self._yolo_classnames_cache:
+            return self._yolo_classnames_cache[model_path]
+        names_list: list = []
+        try:
+            # 既にロード済みのモデルがあればそれを使う
+            cached = self._yolo_model_cache.get(model_path)
+            if cached is not None:
+                nd = getattr(cached, "names", None) or {}
+                if isinstance(nd, dict):
+                    names_list = [nd[k] for k in sorted(nd.keys())]
+                elif isinstance(nd, list):
+                    names_list = list(nd)
+            else:
+                # まず ultralytics 経由（あればそのままキャッシュに載せる）
+                try:
+                    from ultralytics import YOLO  # type: ignore
+                    m = YOLO(model_path)
+                    self._yolo_model_cache[model_path] = m
+                    nd = getattr(m, "names", None) or {}
+                    if isinstance(nd, dict):
+                        names_list = [nd[k] for k in sorted(nd.keys())]
+                    elif isinstance(nd, list):
+                        names_list = list(nd)
+                except ImportError:
+                    # ultralytics 未導入 → torch.load で raw checkpoint からクラス名を抽出
+                    try:
+                        import torch  # type: ignore
+                        ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
+                        nd = None
+                        if isinstance(ckpt, dict):
+                            nd = ckpt.get("names")
+                            if nd is None:
+                                inner = ckpt.get("model")
+                                nd = getattr(inner, "names", None)
+                        else:
+                            nd = getattr(ckpt, "names", None)
+                        if isinstance(nd, dict):
+                            names_list = [nd[k] for k in sorted(nd.keys())]
+                        elif isinstance(nd, list):
+                            names_list = list(nd)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        self._yolo_classnames_cache[model_path] = names_list
+        return names_list
+
+    def _gather_target_class_names(self, model_paths) -> list:
+        """指定モデル群のクラス名を統合（重複排除・出現順）。"""
+        seen: set = set()
+        ordered: list = []
+        for p in model_paths:
+            if not p or not os.path.isfile(p):
+                continue
+            for n in self._get_class_names_from_pt(p):
+                if n and n not in seen:
+                    seen.add(n)
+                    ordered.append(n)
+        return ordered
+
     # ── エントリーポイント ──────────────────────────────────
 
     def auto_detect_yolo(self):
@@ -1452,9 +1527,15 @@ class MosaicEditor:
         if not model_path:
             return
 
+        # 利用可能な全モデルのリスト
+        all_available_models = [p for p in ADDITIONAL_YOLO_MODELS if os.path.isfile(p)]
+        if model_path and model_path not in all_available_models and os.path.isfile(model_path):
+            all_available_models = [model_path] + all_available_models
+
         conf_win = tk.Toplevel(self.root)
         conf_win.title("YOLO 検出設定")
-        conf_win.geometry("360x280" if self.is_video else "360x240")
+        # モデル選択行ぶん高さを少し増やす
+        conf_win.geometry("420x360" if self.is_video else "420x320")
         conf_win.resizable(False, False)
         conf_win.grab_set()
 
@@ -1462,32 +1543,76 @@ class MosaicEditor:
                  font=("", 9)).pack(pady=(8, 0))
         conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.5))
         conf_scale = tk.Scale(conf_win, from_=0.1, to=1.0, resolution=0.05,
-                              variable=conf_var, orient=tk.HORIZONTAL, length=260,
+                              variable=conf_var, orient=tk.HORIZONTAL, length=320,
                               showvalue=True)
         conf_scale.pack(padx=20)
 
-        # 対象クラス選択
+        # ── モデル選択 ─────────────────────────────────────────
+        tk.Label(conf_win, text="使用モデル:", font=("", 9)).pack(pady=(4, 0))
+        model_sel_frm = tk.Frame(conf_win)
+        model_sel_frm.pack()
+        # 直前の選択を復元（無ければ "all"）
+        prev_choice = getattr(self, '_yolo_selected_choice', 'all')
+        # 利用可能なモデルが変わっていた場合に備えてバリデート
+        valid_choices = ["all"] + all_available_models
+        if prev_choice not in valid_choices:
+            prev_choice = "all"
+        model_choice_var = tk.StringVar(value=prev_choice)
+
+        if len(all_available_models) >= 2:
+            tk.Radiobutton(model_sel_frm, text="両方", variable=model_choice_var,
+                           value="all").pack(side="left", padx=2)
+        for p in all_available_models:
+            tk.Radiobutton(model_sel_frm, text=os.path.basename(p),
+                           variable=model_choice_var, value=p).pack(side="left", padx=2)
+
+        # ── 対象クラス選択（モデル変更で動的に再構築） ─────────
         tk.Label(conf_win, text="検出対象:", font=("", 9)).pack(pady=(4, 0))
         cls_frm = tk.Frame(conf_win)
         cls_frm.pack(pady=2)
-        
-        # 過去の選択状態があれば復元、なければ全てTrue
+
+        # 過去の選択状態を保持
         if not hasattr(self, '_yolo_target_classes'):
-            self._yolo_target_classes = {
-                "nipples": True, "pussy": True, "anus": True, "penis": True,
-                "testicles": True, "x-ray": True, "cross-section": True
-            }
-        
-        cls_vars = {}
-        row, col = 0, 0
-        for i, cname in enumerate(self._yolo_target_classes.keys()):
-            var = tk.BooleanVar(value=self._yolo_target_classes[cname])
-            cls_vars[cname] = var
-            tk.Checkbutton(cls_frm, text=cname, variable=var).grid(row=row, column=col, sticky="w", padx=4)
-            col += 1
-            if col > 2:
-                col = 0
-                row += 1
+            self._yolo_target_classes = {}
+
+        cls_vars: dict = {}
+
+        def _resolve_paths_for_choice(choice: str) -> list:
+            if choice == "all":
+                return list(all_available_models)
+            return [choice] if choice in all_available_models else list(all_available_models)
+
+        def _rebuild_cls_checkboxes(*_):
+            # 既存のチェックボックスをクリア
+            for w in cls_frm.winfo_children():
+                w.destroy()
+            cls_vars.clear()
+
+            paths = _resolve_paths_for_choice(model_choice_var.get())
+            discovered = self._gather_target_class_names(paths)
+
+            # 新しいクラスはデフォルト値で初期化
+            for cname in discovered:
+                if cname not in self._yolo_target_classes:
+                    self._yolo_target_classes[cname] = cname in self._YOLO_DEFAULT_ON_CLASSES
+
+            if discovered:
+                row, col = 0, 0
+                for cname in discovered:
+                    var = tk.BooleanVar(value=self._yolo_target_classes.get(cname, False))
+                    cls_vars[cname] = var
+                    tk.Checkbutton(cls_frm, text=cname, variable=var).grid(row=row, column=col, sticky="w", padx=4)
+                    col += 1
+                    if col > 2:
+                        col = 0
+                        row += 1
+            else:
+                tk.Label(cls_frm, text="(クラス情報を取得できませんでした — 全クラスを対象にします)",
+                         font=("", 8), fg="#888888").pack()
+
+        # 初回構築 + ラジオ変更時に再構築
+        _rebuild_cls_checkboxes()
+        model_choice_var.trace_add("write", _rebuild_cls_checkboxes)
 
         # 動画の場合のみ全フレーム選択UIを追加
         process_all_var = tk.BooleanVar(value=False)
@@ -1519,10 +1644,18 @@ class MosaicEditor:
         conf = conf_var.get()
         process_all = process_all_var.get()
         self._yolo_conf = conf  # 次回起動時の初期値として記憶
-        
+
+        # モデル選択を記憶
+        choice = model_choice_var.get()
+        self._yolo_selected_choice = choice
+        selected_models = _resolve_paths_for_choice(choice)
+        # メイン model_path を選択されたものに合わせる（メッセージ等の表示用）
+        if selected_models:
+            model_path = selected_models[0]
+
         # 選択されたクラスを記憶
         target_classes = [cname for cname, var in cls_vars.items() if var.get()]
-        for cname in self._yolo_target_classes:
+        for cname in cls_vars:
             self._yolo_target_classes[cname] = cname in target_classes
 
         # ultralytics がインストール済みか確認
@@ -1530,7 +1663,9 @@ class MosaicEditor:
             import ultralytics  # type: ignore  # noqa: F401
             if not process_all:
                 self.push_history()
-            self._run_yolo_detection(model_path, conf=conf, process_all=process_all, target_classes=target_classes)
+            self._run_yolo_detection(model_path, conf=conf, process_all=process_all,
+                                     target_classes=target_classes,
+                                     selected_models=selected_models)
         except ImportError:
             if not messagebox.askyesno(
                 "ultralytics 自動インストール",
@@ -1539,11 +1674,13 @@ class MosaicEditor:
                 "（pip install ultralytics を実行します）"
             ):
                 return
-            self._install_and_detect_yolo(model_path, conf=conf, process_all=process_all, target_classes=target_classes)
+            self._install_and_detect_yolo(model_path, conf=conf, process_all=process_all,
+                                          target_classes=target_classes,
+                                          selected_models=selected_models)
 
     # ── インストール ────────────────────────────────────────
 
-    def _install_and_detect_yolo(self, model_path: str, conf: float = 0.5, process_all: bool = False, target_classes: list = None):
+    def _install_and_detect_yolo(self, model_path: str, conf: float = 0.5, process_all: bool = False, target_classes: list = None, selected_models: list = None):
         """バックグラウンドで ultralytics をインストールして検出を実行する"""
         import subprocess
         import queue
@@ -1611,17 +1748,17 @@ class MosaicEditor:
                 return
 
             log_queue.put("\n✅ インストール完了！検出を開始します。\n")
-            self.root.after(0, lambda: self._yolo_install_success(progress_win, model_path, conf, process_all, target_classes))
+            self.root.after(0, lambda: self._yolo_install_success(progress_win, model_path, conf, process_all, target_classes, selected_models))
 
         progress_win.after(100, poll_queue)
         threading.Thread(target=do_install, daemon=True).start()
 
-    def _yolo_install_success(self, progress_win, model_path: str, conf: float = 0.5, process_all: bool = False, target_classes: list = None):
+    def _yolo_install_success(self, progress_win, model_path: str, conf: float = 0.5, process_all: bool = False, target_classes: list = None, selected_models: list = None):
         progress_win.destroy()
         messagebox.showinfo("完了", "ultralytics のインストールが完了しました！\n検出を開始します。")
         if not process_all:
             self.push_history()
-        self._run_yolo_detection(model_path, conf=conf, process_all=process_all, target_classes=target_classes)
+        self._run_yolo_detection(model_path, conf=conf, process_all=process_all, target_classes=target_classes, selected_models=selected_models)
 
     def _yolo_install_fail(self, progress_win, err: str):
         progress_win.title("インストール失敗")
@@ -1638,8 +1775,11 @@ class MosaicEditor:
 
     # ── 推論 ────────────────────────────────────────────────
 
-    def _run_yolo_detection(self, model_path: str, conf: float = 0.5, process_all: bool = False, target_classes: list = None):
-        """YOLOで推論実行（セグメンテーション対応 / バックグラウンドスレッド）"""
+    def _run_yolo_detection(self, model_path: str, conf: float = 0.5, process_all: bool = False, target_classes: list = None, selected_models: list = None):
+        """YOLOで推論実行（セグメンテーション対応 / バックグラウンドスレッド）
+
+        selected_models: 使用するモデルパスのリスト。None の場合は ADDITIONAL_YOLO_MODELS をフォールバックとして使う。
+        """
         if self.original_image is None:
             return
 
@@ -1662,8 +1802,13 @@ class MosaicEditor:
             bar.pack(padx=20)
             bar.start(10)
 
-        tk.Label(wait_win, text=f"conf={conf:.1f}  model={os.path.basename(model_path)}",
-                 font=("", 8), fg="gray").pack()
+        # モデル表示ラベル
+        if selected_models:
+            model_label = ", ".join(os.path.basename(p) for p in selected_models)
+        else:
+            model_label = os.path.basename(model_path)
+        tk.Label(wait_win, text=f"conf={conf:.1f}  model={model_label}",
+                 font=("", 8), fg="gray", wraplength=340, justify="left").pack()
 
         # キャンセル用フラグ
         self._yolo_cancel = False
@@ -1691,16 +1836,23 @@ class MosaicEditor:
 
         def detect_worker():
             try:
+                # 使用するモデルのリストを決定
+                if selected_models:
+                    target_paths = [p for p in selected_models if os.path.isfile(p)]
+                else:
+                    target_paths = [model_path] + [
+                        p for p in ADDITIONAL_YOLO_MODELS
+                        if os.path.isfile(p) and p != model_path
+                    ]
                 # キャッシュ済みモデルを使用（初回のみディスクからロード）
-                model = self._get_cached_yolo(model_path)
-                extra_models = []
-                for ep in ADDITIONAL_YOLO_MODELS:
-                    if os.path.isfile(ep) and ep != model_path:
-                        try:
-                            extra_models.append(self._get_cached_yolo(ep))
-                        except Exception:
-                            pass
-                all_models = [model] + extra_models
+                all_models = []
+                for p in target_paths:
+                    try:
+                        all_models.append(self._get_cached_yolo(p))
+                    except Exception:
+                        pass
+                if not all_models:
+                    raise RuntimeError("使用可能なモデルが見つかりませんでした")
 
                 if not process_all:
                     # 単一フレーム：全モデルでタイリング推論 → 合成マスクを直接適用
@@ -2183,46 +2335,88 @@ class MosaicEditor:
         if model_path is None:
             return  # モデルが無ければ静かにスキップ
 
+        # 利用可能な全モデル
+        all_available_models = [p for p in ADDITIONAL_YOLO_MODELS if os.path.isfile(p)]
+        if model_path and model_path not in all_available_models and os.path.isfile(model_path):
+            all_available_models = [model_path] + all_available_models
+
         # 確認ダイアログ
         conf_dlg = tk.Toplevel(self.root)
         conf_dlg.title("自動モザイク")
-        conf_dlg.geometry("380x320")
+        conf_dlg.geometry("440x420")
         conf_dlg.resizable(False, False)
         conf_dlg.grab_set()
 
         tk.Label(conf_dlg,
                  text=f"フォルダ内の画像 {len(img_files)} 枚に\n自動モザイク (YOLO) を適用しますか？",
                  font=("", 10), pady=8).pack()
-        tk.Label(conf_dlg, text=f"モデル: {os.path.basename(model_path)}",
-                 font=("", 8), fg="gray").pack()
+
+        # ── モデル選択 ─────────────────────────────────────────
+        tk.Label(conf_dlg, text="使用モデル:", font=("", 9)).pack(pady=(2, 0))
+        model_sel_frm = tk.Frame(conf_dlg)
+        model_sel_frm.pack()
+        prev_choice = getattr(self, '_yolo_selected_choice', 'all')
+        valid_choices = ["all"] + all_available_models
+        if prev_choice not in valid_choices:
+            prev_choice = "all"
+        model_choice_var = tk.StringVar(value=prev_choice)
+
+        if len(all_available_models) >= 2:
+            tk.Radiobutton(model_sel_frm, text="両方", variable=model_choice_var,
+                           value="all").pack(side="left", padx=2)
+        for p in all_available_models:
+            tk.Radiobutton(model_sel_frm, text=os.path.basename(p),
+                           variable=model_choice_var, value=p).pack(side="left", padx=2)
 
         tk.Label(conf_dlg, text="信頼度閾値:", font=("", 9)).pack(pady=(6, 0))
         conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.5))
         tk.Scale(conf_dlg, from_=0.1, to=1.0, resolution=0.05,
-                 variable=conf_var, orient=tk.HORIZONTAL, length=260,
+                 variable=conf_var, orient=tk.HORIZONTAL, length=320,
                  showvalue=True).pack()
 
-        # 対象クラス選択（nipplesはデフォルトでオフ）
+        # ── 対象クラス選択（モデル変更で動的に再構築） ─────────
         tk.Label(conf_dlg, text="検出対象クラス:", font=("", 9)).pack(pady=(6, 0))
         cls_frm = tk.Frame(conf_dlg)
         cls_frm.pack(pady=2)
-        _default_batch_classes = {
-            "nipples": False, "pussy": True, "anus": True, "penis": True,
-            "testicles": True, "x-ray": True, "cross-section": True
-        }
-        # 前回の選択状態があれば復元（ただしnipplesの初期値はFalseのまま）
+
         if not hasattr(self, '_batch_target_classes'):
-            self._batch_target_classes = dict(_default_batch_classes)
-        batch_cls_vars = {}
-        row, col = 0, 0
-        for i, cname in enumerate(_default_batch_classes.keys()):
-            var = tk.BooleanVar(value=self._batch_target_classes.get(cname, _default_batch_classes[cname]))
-            batch_cls_vars[cname] = var
-            tk.Checkbutton(cls_frm, text=cname, variable=var).grid(row=row, column=col, sticky="w", padx=4)
-            col += 1
-            if col > 2:
-                col = 0
-                row += 1
+            self._batch_target_classes = {}
+
+        batch_cls_vars: dict = {}
+
+        def _resolve_paths_for_choice(choice: str) -> list:
+            if choice == "all":
+                return list(all_available_models)
+            return [choice] if choice in all_available_models else list(all_available_models)
+
+        def _rebuild_cls_checkboxes(*_):
+            for w in cls_frm.winfo_children():
+                w.destroy()
+            batch_cls_vars.clear()
+
+            paths = _resolve_paths_for_choice(model_choice_var.get())
+            discovered = self._gather_target_class_names(paths)
+
+            for cname in discovered:
+                if cname not in self._batch_target_classes:
+                    self._batch_target_classes[cname] = cname in self._YOLO_DEFAULT_ON_CLASSES
+
+            if discovered:
+                row, col = 0, 0
+                for cname in discovered:
+                    var = tk.BooleanVar(value=self._batch_target_classes.get(cname, False))
+                    batch_cls_vars[cname] = var
+                    tk.Checkbutton(cls_frm, text=cname, variable=var).grid(row=row, column=col, sticky="w", padx=4)
+                    col += 1
+                    if col > 2:
+                        col = 0
+                        row += 1
+            else:
+                tk.Label(cls_frm, text="(クラス情報を取得できませんでした — 全クラスを対象にします)",
+                         font=("", 8), fg="#888888").pack()
+
+        _rebuild_cls_checkboxes()
+        model_choice_var.trace_add("write", _rebuild_cls_checkboxes)
 
         overwrite_var = tk.BooleanVar(value=False)
         tk.Checkbutton(conf_dlg, text="既存のマスクも上書きする",
@@ -2249,23 +2443,33 @@ class MosaicEditor:
         conf = conf_var.get()
         self._yolo_conf = conf
         overwrite = overwrite_var.get()
+
+        # モデル選択を記憶
+        choice = model_choice_var.get()
+        self._yolo_selected_choice = choice
+        selected_models = _resolve_paths_for_choice(choice)
+        if selected_models:
+            model_path = selected_models[0]
+
         # 選択されたクラスを記憶・取得
         target_classes = [cname for cname, var in batch_cls_vars.items() if var.get()]
-        for cname in self._batch_target_classes:
+        for cname in batch_cls_vars:
             self._batch_target_classes[cname] = cname in target_classes
 
         # ultralyticsが入っていなければインストール確認
         try:
             import ultralytics  # type: ignore  # noqa: F401
-            self._auto_detect_folder_batch(model_path, img_files, conf, overwrite, target_classes)
+            self._auto_detect_folder_batch(model_path, img_files, conf, overwrite,
+                                           target_classes, selected_models=selected_models)
         except ImportError:
             if messagebox.askyesno(
                 "ultralytics 自動インストール",
                 "ultralytics がインストールされていません。\n自動的にインストールしますか？"
             ):
-                self._install_and_folder_batch(model_path, img_files, conf, overwrite, target_classes)
+                self._install_and_folder_batch(model_path, img_files, conf, overwrite,
+                                               target_classes, selected_models=selected_models)
 
-    def _install_and_folder_batch(self, model_path, img_files, conf, overwrite, target_classes=None):
+    def _install_and_folder_batch(self, model_path, img_files, conf, overwrite, target_classes=None, selected_models: list = None):
         """ultralyticsをインストールして一括検出を実行"""
         import subprocess, queue
         progress_win = tk.Toplevel(self.root)
@@ -2316,7 +2520,8 @@ class MosaicEditor:
             if proc.returncode == 0:
                 log_queue.put("\n✅ インストール完了！検出を開始します。\n")
                 self.root.after(0, lambda: (progress_win.destroy(),
-                                            self._auto_detect_folder_batch(model_path, img_files, conf, overwrite, target_classes)))
+                                            self._auto_detect_folder_batch(model_path, img_files, conf, overwrite,
+                                                                            target_classes, selected_models=selected_models)))
             else:
                 log_queue.put("❌ インストール失敗\n")
 
@@ -2325,8 +2530,12 @@ class MosaicEditor:
 
     def _auto_detect_folder_batch(self, model_path: str, img_files: list,
                                    conf: float = 0.5, overwrite: bool = False,
-                                   target_classes: list = None):
-        """全画像にYOLO自動検出を実行してマスクNPZを保存する"""
+                                   target_classes: list = None,
+                                   selected_models: list = None):
+        """全画像にYOLO自動検出を実行してマスクNPZを保存する
+
+        selected_models: 使用するモデルパスのリスト。None なら ADDITIONAL_YOLO_MODELS をフォールバックとして使用。
+        """
         total = len(img_files)
 
         wait_win = tk.Toplevel(self.root)
@@ -2364,12 +2573,17 @@ class MosaicEditor:
 
         def worker():
             try:
-                # キャッシュ済みモデルを使用（初回のみディスクからロード）
-                fixed_existing = [p for p in ADDITIONAL_YOLO_MODELS if os.path.isfile(p)]
-                main_path = fixed_existing[0] if fixed_existing else model_path
+                # 使用するモデル群を決定
+                if selected_models:
+                    target_paths = [p for p in selected_models if os.path.isfile(p)]
+                else:
+                    fixed_existing = [p for p in ADDITIONAL_YOLO_MODELS if os.path.isfile(p)]
+                    main_path = fixed_existing[0] if fixed_existing else model_path
+                    target_paths = [main_path] + [p for p in ADDITIONAL_YOLO_MODELS
+                                                   if os.path.isfile(p) and p != main_path]
+
                 all_models = []
-                for ep in ([main_path] + [p for p in ADDITIONAL_YOLO_MODELS
-                                          if os.path.isfile(p) and p != main_path]):
+                for ep in target_paths:
                     try:
                         all_models.append(self._get_cached_yolo(ep))
                     except Exception:
