@@ -5,6 +5,7 @@ import numpy as np
 import cv2
 import os
 import sys
+import pathlib
 import threading
 from typing import Optional, List
 
@@ -12,10 +13,32 @@ SUPPORTED_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 SUPPORTED_VIDEO_EXT = (".mp4", ".avi", ".mov", ".mkv", ".webm")
 ALL_SUPPORTED_EXT = SUPPORTED_EXT + SUPPORTED_VIDEO_EXT
 
+
+def _discover_yolo_models() -> List[str]:
+    """標準位置 (スクリプトと同じフォルダ / ~/yolo_models) にある .pt をすべて返す。"""
+    found: List[str] = []
+    search_dirs = [
+        pathlib.Path(__file__).resolve().parent,
+        pathlib.Path.home() / "yolo_models",
+    ]
+    seen: set = set()
+    for d in search_dirs:
+        try:
+            if not d.exists():
+                continue
+            for p in sorted(d.glob("*.pt")):
+                sp = str(p)
+                if sp not in seen:
+                    seen.add(sp)
+                    found.append(sp)
+        except Exception:
+            pass
+    return found
+
+
 # 自動検出で使用する固定モデルパス（存在するものをすべて実行）
-ADDITIONAL_YOLO_MODELS = [
-    r"C:\Users\micro\OneDrive\ドキュメント\mosaic_editor\ntd11_anime_nsfw_segm_v5-variant1.pt",
-]
+# スクリプトと同階層 or ~/yolo_models にある .pt を自動検出（ユーザー固有のハードコードは禁止）
+ADDITIONAL_YOLO_MODELS = _discover_yolo_models()
 
 
 class MosaicEditor:
@@ -148,6 +171,8 @@ class MosaicEditor:
             self.image_list = all_files
             self.current_index = 0
             self.load_current_file()
+            # D&D 後にも自動検出をオファー（フォルダ open と同じ挙動）
+            self.root.after(200, self._offer_folder_auto_detect)
         except Exception as e:
             messagebox.showerror("D&Dエラー", str(e))
 
