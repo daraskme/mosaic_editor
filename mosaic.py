@@ -14,6 +14,15 @@ SUPPORTED_VIDEO_EXT = (".mp4", ".avi", ".mov", ".mkv", ".webm")
 ALL_SUPPORTED_EXT = SUPPORTED_EXT + SUPPORTED_VIDEO_EXT
 
 
+def _model_sort_key(path: str) -> tuple:
+    """フル/メインモデルを優先し、variant・ベース系モデルを後ろに並べる。"""
+    name = os.path.basename(path).lower()
+    # ベース系（COCO の yolov8 等）は最後、variant 系はその次、フル/メイン系を先頭。
+    is_base = 1 if name.startswith(("yolov8", "yolov9", "yolov10", "yolov11")) else 0
+    is_variant = 1 if "variant" in name else 0
+    return (is_base, is_variant, name)
+
+
 def _discover_yolo_models() -> List[str]:
     """標準位置 (スクリプトと同じフォルダ / ~/yolo_models) にある .pt をすべて返す。"""
     found: List[str] = []
@@ -26,13 +35,14 @@ def _discover_yolo_models() -> List[str]:
         try:
             if not d.exists():
                 continue
-            for p in sorted(d.glob("*.pt")):
+            for p in d.glob("*.pt"):
                 sp = str(p)
                 if sp not in seen:
                     seen.add(sp)
                     found.append(sp)
         except Exception:
             pass
+    found.sort(key=_model_sort_key)
     return found
 
 
@@ -1448,6 +1458,15 @@ class MosaicEditor:
         "penis", "pussy", "testicles", "x-ray", "cross-section",
     }
 
+    # ユーザーが「確実に検出してほしい」と指定した重点クラス。
+    # これらのクラスはユーザー設定 conf より低い実効しきい値を許容することで
+    # 取りこぼしを減らす（フォルスポジティブよりリコール重視）。
+    # wenaka 系の同義語 (dick/vagina) も同列に扱う。
+    _YOLO_PRIORITY_CLASSES = {
+        "pussy", "penis", "testicles", "cross-section",
+        "vagina", "dick",  # wenaka_yolov8s-seg の同義語
+    }
+
     def _get_class_names_from_pt(self, model_path: str) -> list:
         """.pt ファイルからクラス名リストを取得。ultralytics 未導入でも torch だけで読む。"""
         if model_path in self._yolo_classnames_cache:
@@ -2184,10 +2203,19 @@ class MosaicEditor:
 
         img_np は **BGR** (cv2/ultralytics 規約) を期待する。RGB を渡すとチャネル順が
         ずれて検出精度が大きく低下する。
+
+        重点クラス (_YOLO_PRIORITY_CLASSES) は実効しきい値を下げてリコール重視で
+        判定し、それ以外のクラスはユーザー指定 conf をそのまま要求する。
         """
         h, w = img_np.shape[:2]
         mask = np.zeros((h, w), dtype=np.uint8)
         self._yolo_last_errors = []
+
+        # 重点クラス用の低いしきい値: ユーザー設定 conf より 0.2 下げて取りこぼしを抑える。
+        # 推論時には min(conf, priority_conf) を YOLO に渡し、候補を多めに受け取った上で
+        # クラスごとに必要な信頼度を満たすか自分でフィルタする。
+        priority_conf = max(0.25, conf - 0.2)
+        model_conf = min(conf, priority_conf)
 
         # GPU が使えるなら FP16 で速度向上
         try:
@@ -2204,6 +2232,9 @@ class MosaicEditor:
             pts_f[:, 1] = np.clip(pts_f[:, 1] + oy, 0, h - 1)
             pts_cv = pts_f.astype(np.int32).reshape((-1, 1, 2))
             cv2.fillPoly(mask, [pts_cv], 255)
+
+        def _required_conf(cname: str) -> float:
+            return priority_conf if cname in self._YOLO_PRIORITY_CLASSES else conf
 
         def _apply_single(result, ox: int, oy: int):
             """単一 Result オブジェクトをマスクに描画する。"""
@@ -2229,7 +2260,7 @@ class MosaicEditor:
                         cname = names.get(cid, str(cid))
                         if target_classes and cname not in target_classes:
                             continue
-                        if float(boxes.conf[i]) < conf:
+                        if float(boxes.conf[i]) < _required_conf(cname):
                             continue
                         _draw_polygon(pts, ox, oy)
                     except Exception as e:
@@ -2241,7 +2272,7 @@ class MosaicEditor:
                         cname = names.get(cid, str(cid))
                         if target_classes and cname not in target_classes:
                             continue
-                        if float(boxes.conf[i]) < conf:
+                        if float(boxes.conf[i]) < _required_conf(cname):
                             continue
                         bx1, by1, bx2, by2 = boxes.xyxy[i].tolist()
                         x1 = max(0, min(w, ox + int(min(bx1, bx2))))
@@ -2255,7 +2286,7 @@ class MosaicEditor:
 
         infer_imgsz = 1024
         long_side = max(w, h)
-        infer_kwargs = dict(verbose=False, conf=conf, imgsz=infer_imgsz, half=use_half)
+        infer_kwargs = dict(verbose=False, conf=model_conf, imgsz=infer_imgsz, half=use_half)
 
         if long_side <= tile_size * 1.5:
             # 画像全体を1回で推論

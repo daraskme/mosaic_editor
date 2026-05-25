@@ -22,11 +22,18 @@ PythonとTkinterで作られた画像モザイク編集ツールです。
 
 | モデルファイル | 検出クラス | 推奨conf |
 |---------------|-----------|---------|
-| `ntd11_anime_nsfw_segm_v5-variant1.pt` | nipples / pussy / anus / penis / testicles / x-ray / cross-section | 0.5〜0.8 |
+| `ntd11_anime_nsfw_segm_v5.pt` (推奨/フル版) | nipples / pussy / anus / penis / testicles / x-ray / cross-section | 0.5〜0.8 |
+| `ntd11_anime_nsfw_segm_v5-variant1.pt` | (同上) | 0.5〜0.8 |
+| `wenaka_yolov8s-seg.pt` | anus / cum / dick / tits / vagina | 0.5〜0.8 |
 
-モデルは起動時に `mosaic_editor/` フォルダ内を自動探索します。
-別のモデルを使う場合は同フォルダか `~/yolo_models/` に `.pt` を置くか、
+モデルは起動時に `mosaic_editor/` フォルダ内を自動探索します。フル版 (variant でない方) が
+優先表示されます。別のモデルを使う場合は同フォルダか `~/yolo_models/` に `.pt` を置くか、
 メニュー「自動検出」>「YOLOモデルを選択...」で直接指定できます。
+
+> **重点クラスの低しきい値**: `pussy` / `penis` / `testicles` / `cross-section`
+> （および wenaka 系の同義語 `vagina` / `dick`）は重点クラスとして扱われ、
+> 内部的に `conf - 0.2`（下限 0.25）の低いしきい値が適用されます。
+> conf スライダーを上げてもこの 4 クラスは取りこぼしにくくなっています。
 
 ### 自動検出の手順
 
