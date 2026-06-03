@@ -1,11 +1,10 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk
 import numpy as np
 import cv2
 import os
 import sys
-import pathlib
 import threading
 from typing import Optional, List
 
@@ -14,41 +13,12 @@ SUPPORTED_VIDEO_EXT = (".mp4", ".avi", ".mov", ".mkv", ".webm")
 ALL_SUPPORTED_EXT = SUPPORTED_EXT + SUPPORTED_VIDEO_EXT
 
 
-def _model_sort_key(path: str) -> tuple:
-    """フル/メインモデルを優先し、variant・ベース系モデルを後ろに並べる。"""
-    name = os.path.basename(path).lower()
-    # ベース系（COCO の yolov8 等）は最後、variant 系はその次、フル/メイン系を先頭。
-    is_base = 1 if name.startswith(("yolov8", "yolov9", "yolov10", "yolov11")) else 0
-    is_variant = 1 if "variant" in name else 0
-    return (is_base, is_variant, name)
-
-
-def _discover_yolo_models() -> List[str]:
-    """標準位置 (スクリプトと同じフォルダ / ~/yolo_models) にある .pt をすべて返す。"""
-    found: List[str] = []
-    search_dirs = [
-        pathlib.Path(__file__).resolve().parent,
-        pathlib.Path.home() / "yolo_models",
-    ]
-    seen: set = set()
-    for d in search_dirs:
-        try:
-            if not d.exists():
-                continue
-            for p in d.glob("*.pt"):
-                sp = str(p)
-                if sp not in seen:
-                    seen.add(sp)
-                    found.append(sp)
-        except Exception:
-            pass
-    found.sort(key=_model_sort_key)
-    return found
-
-
-# 自動検出で使用する固定モデルパス（存在するものをすべて実行）
-# スクリプトと同階層 or ~/yolo_models にある .pt を自動検出（ユーザー固有のハードコードは禁止）
-ADDITIONAL_YOLO_MODELS = _discover_yolo_models()
+# 自動検出 (LocateAnything-3B + SAM) のラッパー
+from auto_detect import (
+    AutoMosaicPipeline,
+    DEFAULT_CATEGORIES,
+    GENERATION_MODES,
+)
 
 
 class MosaicEditor:
@@ -112,12 +82,13 @@ class MosaicEditor:
         self._pen_last_ix: Optional[int] = None
         self._pen_last_iy: Optional[int] = None
 
-        # YOLO 推論エラー収集
-        self._yolo_last_errors: List[str] = []
-        # YOLO モデルキャッシュ（ロード済みインスタンスを再利用）
-        self._yolo_model_cache: dict = {}
-        # .pt ごとのクラス名リスト（ultralytics ロード前でも参照したい）
-        self._yolo_classnames_cache: dict = {}
+        # 自動検出 (LocateAnything-3B + SAM) 用の状態
+        self._auto_pipeline: Optional[AutoMosaicPipeline] = None
+        self._auto_target_classes: dict = {c: True for c in DEFAULT_CATEGORIES}
+        self._auto_extra_classes: List[str] = []  # ユーザー追加クラス
+        self._auto_gen_mode: str = "hybrid"
+        self._auto_use_sam: bool = True
+        self._auto_cancel: bool = False
 
         self.canvas = tk.Canvas(self.root, cursor="crosshair", bg="gray")
 
@@ -322,8 +293,8 @@ class MosaicEditor:
         menubar.add_cascade(label="ファイル", menu=filemenu)
 
         detectmenu = tk.Menu(menubar, tearoff=0)
-        detectmenu.add_command(label="自動検出 (YOLO)", command=self.auto_detect_yolo)
-        detectmenu.add_command(label="YOLOモデルを選択...", command=self.select_yolo_model)
+        detectmenu.add_command(label="自動検出 (LocateAnything-3B)",
+                               command=self.auto_detect_open_dialog)
         menubar.add_cascade(label="自動検出", menu=detectmenu)
 
         self.root.config(menu=menubar)
@@ -342,7 +313,7 @@ class MosaicEditor:
         tk.Button(top, text="縮小", command=self.zoom_out).pack(side="left", padx=(2, 0))
         tk.Button(top, text="100%", command=self.zoom_custom).pack(side="left", padx=(2, 0))
 
-        tk.Button(top, text="自動検出 (YOLO)", command=self.auto_detect_yolo,
+        tk.Button(top, text="自動検出", command=self.auto_detect_open_dialog,
                   bg="#4a90d9", fg="white", relief="flat", padx=6).pack(side="left", padx=(10, 0))
 
         # 「作成しない」トグルボタン
@@ -1388,338 +1359,74 @@ class MosaicEditor:
             self.current_index -= 1
             self.load_current_file()
 
-    # ================= 自動検出 (YOLO) =================
+    # ================= 自動検出 (LocateAnything-3B + SAM) =================
 
-    # ── モデルパス管理 ──────────────────────────────────────
+    REQUIRED_PACKAGES = ("transformers", "torch", "peft", "accelerate")
 
-    def _find_yolo_model(self) -> str | None:
-        """YOLOモデル(.pt)を自動探索する。見つからなければNoneを返す。"""
-        import pathlib
-        search_dirs = [
-            pathlib.Path(__file__).parent,          # mosaic_editor/ フォルダ
-            pathlib.Path.home() / "yolo_models",    # ~/yolo_models/
-        ]
-        for d in search_dirs:
-            if not d.exists():
-                continue
-            pts = sorted(d.glob("*.pt"))
-            if pts:
-                return str(pts[0])
-        return None
+    def _get_pipeline(self) -> AutoMosaicPipeline:
+        if self._auto_pipeline is None:
+            self._auto_pipeline = AutoMosaicPipeline()
+        return self._auto_pipeline
 
-    def select_yolo_model(self):
-        """ファイルダイアログでYOLOモデルを選択してインスタンス変数に保存"""
-        path = filedialog.askopenfilename(
-            title="YOLOモデル (.pt) を選択",
-            filetypes=[("YOLO model", "*.pt"), ("All files", "*.*")]
-        )
-        if path:
-            self._yolo_model_path = path
-            messagebox.showinfo("モデル設定", f"モデルをセットしました:\n{path}")
+    def _all_categories(self) -> List[str]:
+        cats = list(DEFAULT_CATEGORIES)
+        for c in self._auto_extra_classes:
+            if c not in cats:
+                cats.append(c)
+        return cats
 
-    def _get_yolo_model_path(self) -> str | None:
-        """現在設定済みのモデルパスを取得。なければ自動探索、それもなければダイアログ。"""
-        # インスタンスに保存されていればそれを使う
-        if hasattr(self, '_yolo_model_path') and self._yolo_model_path:
-            import os
-            if os.path.isfile(self._yolo_model_path):
-                return self._yolo_model_path
-        # 自動探索
-        found = self._find_yolo_model()
-        if found:
-            self._yolo_model_path = found
-            return found
-        # ダイアログで選択を促す
-        messagebox.showinfo(
-            "YOLOモデルが見つかりません",
-            "YOLOモデル (.pt) が見つかりませんでした。\n\n"
-            "以下のいずれかに .pt ファイルを置いてください:\n"
-            "  ① mosaic_editor/ フォルダ内\n"
-            "  ② ~/yolo_models/ フォルダ内\n\n"
-            "または次のダイアログでファイルを直接選択してください。"
-        )
-        path = filedialog.askopenfilename(
-            title="YOLOモデル (.pt) を選択",
-            filetypes=[("YOLO model", "*.pt"), ("All files", "*.*")]
-        )
-        if path:
-            self._yolo_model_path = path
-            return path
-        return None
+    def _selected_categories(self) -> List[str]:
+        return [c for c in self._all_categories()
+                if self._auto_target_classes.get(c, False)]
 
-    # ── クラス名抽出 ──────────────────────────────────────────
+    # ── 依存パッケージ確認 ───────────────────────────────────
 
-    # 検出対象としてデフォルトでオンにするクラス名（モデル間で共通）
-    # nipples, tits, cum はデフォルトOFFとし、ユーザーが必要なら手動で有効化する
-    _YOLO_DEFAULT_ON_CLASSES = {
-        # wenaka_yolov8s-seg
-        "dick", "vagina", "anus",
-        # ntd11_anime_nsfw_segm_v5
-        "penis", "pussy", "testicles", "x-ray", "cross-section",
-    }
+    def _check_deps(self) -> List[str]:
+        """未インストールのパッケージ名リストを返す。"""
+        missing: List[str] = []
+        for pkg in self.REQUIRED_PACKAGES:
+            try:
+                __import__(pkg)
+            except ImportError:
+                missing.append(pkg)
+        return missing
 
-    # ユーザーが「確実に検出してほしい」と指定した重点クラス。
-    # これらのクラスはユーザー設定 conf より低い実効しきい値を許容することで
-    # 取りこぼしを減らす（フォルスポジティブよりリコール重視）。
-    # wenaka 系の同義語 (dick/vagina) も同列に扱う。
-    _YOLO_PRIORITY_CLASSES = {
-        "pussy", "penis", "testicles", "cross-section",
-        "vagina", "dick",  # wenaka_yolov8s-seg の同義語
-    }
-
-    def _get_class_names_from_pt(self, model_path: str) -> list:
-        """.pt ファイルからクラス名リストを取得。ultralytics 未導入でも torch だけで読む。"""
-        if model_path in self._yolo_classnames_cache:
-            return self._yolo_classnames_cache[model_path]
-        names_list: list = []
-        try:
-            # 既にロード済みのモデルがあればそれを使う
-            cached = self._yolo_model_cache.get(model_path)
-            if cached is not None:
-                nd = getattr(cached, "names", None) or {}
-                if isinstance(nd, dict):
-                    names_list = [nd[k] for k in sorted(nd.keys())]
-                elif isinstance(nd, list):
-                    names_list = list(nd)
-            else:
-                # まず ultralytics 経由（あればそのままキャッシュに載せる）
-                try:
-                    from ultralytics import YOLO  # type: ignore
-                    m = YOLO(model_path)
-                    self._yolo_model_cache[model_path] = m
-                    nd = getattr(m, "names", None) or {}
-                    if isinstance(nd, dict):
-                        names_list = [nd[k] for k in sorted(nd.keys())]
-                    elif isinstance(nd, list):
-                        names_list = list(nd)
-                except ImportError:
-                    # ultralytics 未導入 → torch.load で raw checkpoint からクラス名を抽出
-                    try:
-                        import torch  # type: ignore
-                        ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
-                        nd = None
-                        if isinstance(ckpt, dict):
-                            nd = ckpt.get("names")
-                            if nd is None:
-                                inner = ckpt.get("model")
-                                nd = getattr(inner, "names", None)
-                        else:
-                            nd = getattr(ckpt, "names", None)
-                        if isinstance(nd, dict):
-                            names_list = [nd[k] for k in sorted(nd.keys())]
-                        elif isinstance(nd, list):
-                            names_list = list(nd)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        self._yolo_classnames_cache[model_path] = names_list
-        return names_list
-
-    def _gather_target_class_names(self, model_paths) -> list:
-        """指定モデル群のクラス名を統合（重複排除・出現順）。"""
-        seen: set = set()
-        ordered: list = []
-        for p in model_paths:
-            if not p or not os.path.isfile(p):
-                continue
-            for n in self._get_class_names_from_pt(p):
-                if n and n not in seen:
-                    seen.add(n)
-                    ordered.append(n)
-        return ordered
-
-    # ── エントリーポイント ──────────────────────────────────
-
-    def auto_detect_yolo(self):
-        """YOLOモデルで自動検出してモザイクマスクに追加"""
-        if self.original_image is None:
-            messagebox.showwarning("警告", "画像を開いてください")
+    def _ensure_deps(self, on_ready) -> None:
+        """依存が揃っていれば on_ready() を即実行。なければ自動インストールを提案。"""
+        missing = self._check_deps()
+        if not missing:
+            on_ready()
             return
-
-        # 固定モデルリストの最初の存在するものをメインモデルとして使用
-        fixed_existing = [p for p in ADDITIONAL_YOLO_MODELS if os.path.isfile(p)]
-        if fixed_existing:
-            model_path = fixed_existing[0]
-        else:
-            model_path = self._get_yolo_model_path()
-        if not model_path:
+        if not messagebox.askyesno(
+            "依存パッケージのインストール",
+            "自動検出には以下のパッケージが必要です:\n\n"
+            f"  {', '.join(missing)}\n\n"
+            "自動的にインストールしますか？\n"
+            "（torch は大きいため初回は数百MB〜数GBダウンロードされます）"
+        ):
             return
+        self._install_deps_then(missing, on_ready)
 
-        # 利用可能な全モデルのリスト
-        all_available_models = [p for p in ADDITIONAL_YOLO_MODELS if os.path.isfile(p)]
-        if model_path and model_path not in all_available_models and os.path.isfile(model_path):
-            all_available_models = [model_path] + all_available_models
-
-        conf_win = tk.Toplevel(self.root)
-        conf_win.title("YOLO 検出設定")
-        # モデル選択行ぶん高さを少し増やす
-        conf_win.geometry("420x360" if self.is_video else "420x320")
-        conf_win.resizable(False, False)
-        conf_win.grab_set()
-
-        tk.Label(conf_win, text="信頼度スコア閾値 (推奨: 0.5〜0.8)",
-                 font=("", 9)).pack(pady=(8, 0))
-        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.5))
-        conf_scale = tk.Scale(conf_win, from_=0.1, to=1.0, resolution=0.05,
-                              variable=conf_var, orient=tk.HORIZONTAL, length=320,
-                              showvalue=True)
-        conf_scale.pack(padx=20)
-
-        # ── モデル選択 ─────────────────────────────────────────
-        tk.Label(conf_win, text="使用モデル:", font=("", 9)).pack(pady=(4, 0))
-        model_sel_frm = tk.Frame(conf_win)
-        model_sel_frm.pack()
-        # 直前の選択を復元（無ければ "all"）
-        prev_choice = getattr(self, '_yolo_selected_choice', 'all')
-        # 利用可能なモデルが変わっていた場合に備えてバリデート
-        valid_choices = ["all"] + all_available_models
-        if prev_choice not in valid_choices:
-            prev_choice = "all"
-        model_choice_var = tk.StringVar(value=prev_choice)
-
-        if len(all_available_models) >= 2:
-            tk.Radiobutton(model_sel_frm, text="両方", variable=model_choice_var,
-                           value="all").pack(side="left", padx=2)
-        for p in all_available_models:
-            tk.Radiobutton(model_sel_frm, text=os.path.basename(p),
-                           variable=model_choice_var, value=p).pack(side="left", padx=2)
-
-        # ── 対象クラス選択（モデル変更で動的に再構築） ─────────
-        tk.Label(conf_win, text="検出対象:", font=("", 9)).pack(pady=(4, 0))
-        cls_frm = tk.Frame(conf_win)
-        cls_frm.pack(pady=2)
-
-        # 過去の選択状態を保持
-        if not hasattr(self, '_yolo_target_classes'):
-            self._yolo_target_classes = {}
-
-        cls_vars: dict = {}
-
-        def _resolve_paths_for_choice(choice: str) -> list:
-            if choice == "all":
-                return list(all_available_models)
-            return [choice] if choice in all_available_models else list(all_available_models)
-
-        def _rebuild_cls_checkboxes(*_):
-            # 既存のチェックボックスをクリア
-            for w in cls_frm.winfo_children():
-                w.destroy()
-            cls_vars.clear()
-
-            paths = _resolve_paths_for_choice(model_choice_var.get())
-            discovered = self._gather_target_class_names(paths)
-
-            # 新しいクラスはデフォルト値で初期化
-            for cname in discovered:
-                if cname not in self._yolo_target_classes:
-                    self._yolo_target_classes[cname] = cname in self._YOLO_DEFAULT_ON_CLASSES
-
-            if discovered:
-                row, col = 0, 0
-                for cname in discovered:
-                    var = tk.BooleanVar(value=self._yolo_target_classes.get(cname, False))
-                    cls_vars[cname] = var
-                    tk.Checkbutton(cls_frm, text=cname, variable=var).grid(row=row, column=col, sticky="w", padx=4)
-                    col += 1
-                    if col > 2:
-                        col = 0
-                        row += 1
-            else:
-                tk.Label(cls_frm, text="(クラス情報を取得できませんでした — 全クラスを対象にします)",
-                         font=("", 8), fg="#888888").pack()
-
-        # 初回構築 + ラジオ変更時に再構築
-        _rebuild_cls_checkboxes()
-        model_choice_var.trace_add("write", _rebuild_cls_checkboxes)
-
-        # 動画の場合のみ全フレーム選択UIを追加
-        process_all_var = tk.BooleanVar(value=False)
-        if self.is_video:
-            tk.Label(conf_win, text="処理対象:", font=("", 9)).pack(pady=(6, 0))
-            frm_rad = tk.Frame(conf_win)
-            frm_rad.pack()
-            tk.Radiobutton(frm_rad, text="現在のフレーム", variable=process_all_var, value=False).pack(side="left", padx=4)
-            tk.Radiobutton(frm_rad, text="動画全フレーム", variable=process_all_var, value=True).pack(side="left", padx=4)
-
-        btn_frm = tk.Frame(conf_win)
-        btn_frm.pack(pady=8)
-        do_run = {"ok": False}
-
-        def on_run():
-            do_run["ok"] = True
-            conf_win.destroy()
-
-        tk.Button(btn_frm, text="検出開始", command=on_run,
-                  bg="#3a7bd5", fg="white", relief="flat",
-                  padx=12, pady=4).pack(side="left", padx=6)
-        tk.Button(btn_frm, text="キャンセル", command=conf_win.destroy,
-                  relief="flat", padx=8, pady=4).pack(side="left", padx=6)
-
-        conf_win.wait_window()
-        if not do_run["ok"]:
-            return
-
-        conf = conf_var.get()
-        process_all = process_all_var.get()
-        self._yolo_conf = conf  # 次回起動時の初期値として記憶
-
-        # モデル選択を記憶
-        choice = model_choice_var.get()
-        self._yolo_selected_choice = choice
-        selected_models = _resolve_paths_for_choice(choice)
-        # メイン model_path を選択されたものに合わせる（メッセージ等の表示用）
-        if selected_models:
-            model_path = selected_models[0]
-
-        # 選択されたクラスを記憶
-        target_classes = [cname for cname, var in cls_vars.items() if var.get()]
-        for cname in cls_vars:
-            self._yolo_target_classes[cname] = cname in target_classes
-
-        # ultralytics がインストール済みか確認
-        try:
-            import ultralytics  # type: ignore  # noqa: F401
-            if not process_all:
-                self.push_history()
-            self._run_yolo_detection(model_path, conf=conf, process_all=process_all,
-                                     target_classes=target_classes,
-                                     selected_models=selected_models)
-        except ImportError:
-            if not messagebox.askyesno(
-                "ultralytics 自動インストール",
-                "ultralytics がインストールされていません。\n"
-                "自動的にインストールしますか？\n\n"
-                "（pip install ultralytics を実行します）"
-            ):
-                return
-            self._install_and_detect_yolo(model_path, conf=conf, process_all=process_all,
-                                          target_classes=target_classes,
-                                          selected_models=selected_models)
-
-    # ── インストール ────────────────────────────────────────
-
-    def _install_and_detect_yolo(self, model_path: str, conf: float = 0.5, process_all: bool = False, target_classes: list = None, selected_models: list = None):
-        """バックグラウンドで ultralytics をインストールして検出を実行する"""
+    def _install_deps_then(self, packages: List[str], on_ready) -> None:
         import subprocess
         import queue
 
         progress_win = tk.Toplevel(self.root)
-        progress_win.title("ultralytics インストール中")
-        progress_win.geometry("520x300")
+        progress_win.title("依存パッケージをインストール中")
+        progress_win.geometry("560x320")
         progress_win.resizable(True, True)
         progress_win.grab_set()
 
-        tk.Label(progress_win, text="ultralytics をインストール中...",
+        tk.Label(progress_win, text=f"インストール中: {', '.join(packages)}",
                  font=("", 10, "bold"), pady=6).pack()
 
-        bar = ttk.Progressbar(progress_win, mode="indeterminate", length=490)
+        bar = ttk.Progressbar(progress_win, mode="indeterminate", length=520)
         bar.pack(padx=10)
         bar.start(12)
 
         frame = tk.Frame(progress_win)
         frame.pack(fill="both", expand=True, padx=10, pady=6)
-        log_text = tk.Text(frame, height=12, wrap="word", state="disabled",
+        log_text = tk.Text(frame, height=14, wrap="word", state="disabled",
                            bg="#1e1e1e", fg="#cccccc", font=("Consolas", 9))
         log_text.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(frame, command=log_text.yview)
@@ -1737,326 +1444,342 @@ class MosaicEditor:
         def poll_queue():
             try:
                 while True:
-                    line = log_queue.get_nowait()
-                    append_log(line)
+                    append_log(log_queue.get_nowait())
             except __import__("queue").Empty:
                 pass
             if progress_win.winfo_exists():
-                progress_win.after(100, poll_queue)
+                progress_win.after(120, poll_queue)
 
         def do_install():
-            def run_pip(*args):
-                proc = subprocess.Popen(
-                    [sys.executable, "-m", "pip"] + list(args),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                for line in proc.stdout:  # type: ignore
-                    log_queue.put(line)
-                proc.wait()
-                return proc.returncode == 0
+            args = [sys.executable, "-m", "pip", "install", "--upgrade",
+                    "--no-cache-dir"] + list(packages)
+            log_queue.put(f"$ {' '.join(args)}\n")
+            proc = subprocess.Popen(
+                args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace",
+            )
+            for line in proc.stdout:  # type: ignore
+                log_queue.put(line)
+            proc.wait()
+            if proc.returncode == 0:
+                log_queue.put("\n✅ インストール完了！\n")
+                self.root.after(0, lambda: (progress_win.destroy(), on_ready()))
+            else:
+                log_queue.put("\n❌ インストール失敗\n")
+                self.root.after(0, lambda: self._deps_install_fail(progress_win, packages))
 
-            log_queue.put("\n⏳ ultralytics をインストール中...\n")
-            ok = run_pip("install", "--upgrade", "--no-cache-dir", "ultralytics")
-            if not ok:
-                log_queue.put("❌ ultralytics インストール失敗\n")
-                self.root.after(0, lambda: self._yolo_install_fail(progress_win, "ultralytics インストール失敗"))
-                return
-
-            log_queue.put("\n✅ インストール完了！検出を開始します。\n")
-            self.root.after(0, lambda: self._yolo_install_success(progress_win, model_path, conf, process_all, target_classes, selected_models))
-
-        progress_win.after(100, poll_queue)
+        progress_win.after(120, poll_queue)
         threading.Thread(target=do_install, daemon=True).start()
 
-    def _yolo_install_success(self, progress_win, model_path: str, conf: float = 0.5, process_all: bool = False, target_classes: list = None, selected_models: list = None):
-        progress_win.destroy()
-        messagebox.showinfo("完了", "ultralytics のインストールが完了しました！\n検出を開始します。")
-        if not process_all:
-            self.push_history()
-        self._run_yolo_detection(model_path, conf=conf, process_all=process_all, target_classes=target_classes, selected_models=selected_models)
-
-    def _yolo_install_fail(self, progress_win, err: str):
+    def _deps_install_fail(self, progress_win, packages):
         progress_win.title("インストール失敗")
         for w in progress_win.winfo_children():
             if isinstance(w, ttk.Progressbar):
                 w.stop()
         tk.Label(
             progress_win,
-            text=f"❌ {err}\n\n手動インストール:\n  pip install ultralytics",
-            fg="red", justify="left", wraplength=480, pady=6
+            text=("❌ パッケージインストールに失敗しました。\n\n"
+                  "手動インストール:\n"
+                  f"  pip install {' '.join(packages)}\n"),
+            fg="red", justify="left", wraplength=520, pady=6
         ).pack()
         tk.Button(progress_win, text="閉じる", command=progress_win.destroy,
                   bg="#cc4444", fg="white", relief="flat", padx=12, pady=4).pack(pady=6)
 
-    # ── 推論 ────────────────────────────────────────────────
+    # ── 設定ダイアログ ──────────────────────────────────────
 
-    def _run_yolo_detection(self, model_path: str, conf: float = 0.5, process_all: bool = False, target_classes: list = None, selected_models: list = None):
-        """YOLOで推論実行（セグメンテーション対応 / バックグラウンドスレッド）
+    def _build_detect_config_dialog(self, title: str,
+                                    is_video_mode: bool = False,
+                                    folder_mode: bool = False,
+                                    folder_image_count: int = 0) -> dict:
+        """設定ダイアログを構築して、ユーザー選択結果 dict を返す（キャンセル時 None）。"""
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.geometry("480x520")
+        win.resizable(False, False)
+        win.grab_set()
 
-        selected_models: 使用するモデルパスのリスト。None の場合は ADDITIONAL_YOLO_MODELS をフォールバックとして使う。
-        """
+        if folder_mode:
+            tk.Label(win,
+                     text=f"フォルダ内の画像 {folder_image_count} 枚に自動モザイクを適用します",
+                     font=("", 10), pady=6).pack()
+
+        tk.Label(win, text="検出対象クラス (チェックを入れた対象を検出):",
+                 font=("", 9)).pack(pady=(6, 2))
+
+        cls_outer = tk.Frame(win)
+        cls_outer.pack(fill="x", padx=10)
+        cls_frm = tk.Frame(cls_outer)
+        cls_frm.pack(side="left")
+
+        cls_vars: dict = {}
+
+        def _rebuild_cls():
+            for w in cls_frm.winfo_children():
+                w.destroy()
+            cls_vars.clear()
+            cats = self._all_categories()
+            for i, cname in enumerate(cats):
+                var = tk.BooleanVar(
+                    value=self._auto_target_classes.get(cname, False)
+                )
+                cls_vars[cname] = var
+                row, col = divmod(i, 3)
+                tk.Checkbutton(cls_frm, text=cname, variable=var
+                               ).grid(row=row, column=col, sticky="w", padx=4)
+
+        _rebuild_cls()
+
+        # クラス追加
+        add_frm = tk.Frame(win)
+        add_frm.pack(fill="x", padx=10, pady=(4, 0))
+        tk.Label(add_frm, text="追加クラス:", font=("", 9)).pack(side="left")
+        new_cls_var = tk.StringVar()
+        tk.Entry(add_frm, textvariable=new_cls_var, width=18).pack(side="left", padx=4)
+
+        def _on_add_cls():
+            name = new_cls_var.get().strip().lower()
+            if not name:
+                return
+            if name not in self._auto_extra_classes and name not in DEFAULT_CATEGORIES:
+                self._auto_extra_classes.append(name)
+                self._auto_target_classes[name] = True
+            new_cls_var.set("")
+            # チェック状態を現在の cls_vars から保持してから再構築
+            for k, v in cls_vars.items():
+                self._auto_target_classes[k] = v.get()
+            _rebuild_cls()
+
+        tk.Button(add_frm, text="追加", command=_on_add_cls,
+                  relief="flat", padx=8).pack(side="left")
+
+        # 生成モード
+        tk.Label(win, text="検出強度 (推奨: hybrid):", font=("", 9)).pack(pady=(8, 2))
+        mode_var = tk.StringVar(value=self._auto_gen_mode)
+        mode_frm = tk.Frame(win)
+        mode_frm.pack()
+        for m in GENERATION_MODES:
+            tk.Radiobutton(mode_frm, text=m, variable=mode_var, value=m
+                           ).pack(side="left", padx=6)
+
+        # SAM 再セグメント
+        sam_var = tk.BooleanVar(value=self._auto_use_sam)
+        tk.Checkbutton(win, text="SAM で bbox を輪郭マスクに再セグメント (推奨)",
+                       variable=sam_var).pack(pady=(8, 0))
+
+        # 動画: 全フレーム処理
+        process_all_var = tk.BooleanVar(value=False)
+        if is_video_mode:
+            tk.Label(win, text="処理対象:", font=("", 9)).pack(pady=(8, 0))
+            frm_rad = tk.Frame(win)
+            frm_rad.pack()
+            tk.Radiobutton(frm_rad, text="現在のフレーム", variable=process_all_var,
+                           value=False).pack(side="left", padx=6)
+            tk.Radiobutton(frm_rad, text="動画全フレーム", variable=process_all_var,
+                           value=True).pack(side="left", padx=6)
+
+        # フォルダ: 上書き
+        overwrite_var = tk.BooleanVar(value=False)
+        if folder_mode:
+            tk.Checkbutton(win, text="既存のマスクも上書きする",
+                           variable=overwrite_var).pack(pady=(8, 0))
+
+        # 注意書き
+        tk.Label(win,
+                 text=("注意: LocateAnything-3B は非商用研究目的のみ利用可。\n"
+                       "初回は ~6GB のモデルがダウンロードされます。\n"
+                       "GPU が無い環境では 1 枚あたり数十秒〜数分かかります。"),
+                 font=("", 8), fg="#888888", justify="left", wraplength=460
+                 ).pack(pady=(8, 0))
+
+        btn_frm = tk.Frame(win)
+        btn_frm.pack(pady=10)
+        result: dict = {"ok": False}
+
+        def on_run():
+            result["ok"] = True
+            win.destroy()
+
+        run_label = "適用する" if folder_mode else "検出開始"
+        tk.Button(btn_frm, text=run_label, command=on_run,
+                  bg="#3a7bd5", fg="white", relief="flat",
+                  padx=12, pady=4).pack(side="left", padx=6)
+        tk.Button(btn_frm, text="キャンセル", command=win.destroy,
+                  relief="flat", padx=8, pady=4).pack(side="left", padx=6)
+
+        win.wait_window()
+        if not result["ok"]:
+            return None
+
+        # 状態を保存
+        for k, v in cls_vars.items():
+            self._auto_target_classes[k] = v.get()
+        self._auto_gen_mode = mode_var.get()
+        self._auto_use_sam = sam_var.get()
+
+        return {
+            "categories": [c for c, v in cls_vars.items() if v.get()],
+            "mode": mode_var.get(),
+            "use_sam": sam_var.get(),
+            "process_all": process_all_var.get(),
+            "overwrite": overwrite_var.get(),
+        }
+
+    # ── 単一画像/フレームの検出エントリ ─────────────────────
+
+    def auto_detect_open_dialog(self):
+        """単一画像 or 動画フレームに自動検出を実行する。"""
         if self.original_image is None:
+            messagebox.showwarning("警告", "画像または動画を開いてください")
             return
 
-        wait_win = tk.Toplevel(self.root)
-        wait_win.title("YOLO 自動検出中")
-        wait_win.geometry("360x130" if process_all else "360x100")
-        wait_win.resizable(False, False)
-        wait_win.grab_set()
+        cfg = self._build_detect_config_dialog(
+            "自動検出 (LocateAnything-3B)",
+            is_video_mode=self.is_video,
+        )
+        if cfg is None:
+            return
+        if not cfg["categories"]:
+            messagebox.showwarning("自動検出", "検出対象クラスを1つ以上選んでください")
+            return
 
-        msg = "全フレーム一括検出中..." if process_all else "検出中です。しばらくお待ちください..."
-        tk.Label(wait_win, text=msg, pady=12).pack()
+        def _go():
+            if cfg["process_all"] and self.is_video:
+                self._run_detect_all_video_frames(cfg)
+            else:
+                self.push_history()
+                self._run_detect_current(cfg)
 
-        if process_all:
-            bar = ttk.Progressbar(wait_win, maximum=max(1, self.video_total_frames), length=320)
-            bar.pack(padx=20)
-            pct_label = tk.Label(wait_win, text=f"0 / {self.video_total_frames}", font=("", 9))
-            pct_label.pack()
-        else:
-            bar = ttk.Progressbar(wait_win, mode="indeterminate", length=320)
-            bar.pack(padx=20)
-            bar.start(10)
+        self._ensure_deps(_go)
 
-        # モデル表示ラベル
-        if selected_models:
-            model_label = ", ".join(os.path.basename(p) for p in selected_models)
-        else:
-            model_label = os.path.basename(model_path)
-        tk.Label(wait_win, text=f"conf={conf:.1f}  model={model_label}",
-                 font=("", 8), fg="gray", wraplength=340, justify="left").pack()
+    def _run_detect_current(self, cfg: dict):
+        """現在の画像/フレームに対して検出を実行（バックグラウンド）。"""
+        wait_win, status_label = self._show_progress_window("自動検出中", "検出を開始しています...")
+        current_img = self.original_image.copy()
 
-        # キャンセル用フラグ
-        self._yolo_cancel = False
-        if process_all:
-            def _cancel():
-                self._yolo_cancel = True
-                try:
-                    wait_win.destroy()
-                except Exception:
-                    pass
-            tk.Button(wait_win, text="キャンセル", command=_cancel,
-                      relief="flat", padx=8, pady=0).pack(pady=4)
+        def progress(msg: str):
+            self.root.after(0, lambda m=msg: status_label.config(text=m))
 
-        def _safe_progress(value):
-            # ウィンドウが閉じられた後に呼ばれてもクラッシュしないように
+        def worker():
             try:
-                if not wait_win.winfo_exists():
-                    return
-                bar.config(value=value)
-                pct_label.config(text=f"{value} / {self.video_total_frames}")
-            except Exception:
-                pass
-
-        current_img_copy = self.original_image.copy()
-
-        def detect_worker():
-            try:
-                # 使用するモデルのリストを決定
-                if selected_models:
-                    target_paths = [p for p in selected_models if os.path.isfile(p)]
-                else:
-                    target_paths = [model_path] + [
-                        p for p in ADDITIONAL_YOLO_MODELS
-                        if os.path.isfile(p) and p != model_path
-                    ]
-                # キャッシュ済みモデルを使用（初回のみディスクからロード）
-                all_models = []
-                for p in target_paths:
-                    try:
-                        all_models.append(self._get_cached_yolo(p))
-                    except Exception:
-                        pass
-                if not all_models:
-                    raise RuntimeError("使用可能なモデルが見つかりませんでした")
-
-                if not process_all:
-                    # 単一フレーム：全モデルでタイリング推論 → 合成マスクを直接適用
-                    # PIL は RGB なので ultralytics が期待する BGR (cv2 規約) に変換
-                    img_rgb = np.array(current_img_copy)
-                    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-                    ih, iw = img_bgr.shape[:2]
-                    combined = np.zeros((ih, iw), dtype=np.uint8)
-                    for m in all_models:
-                        if self._yolo_cancel:
-                            break
-                        try:
-                            combined = np.maximum(combined,
-                                self._detect_to_mask(m, img_bgr, conf, target_classes))
-                        except Exception:
-                            pass
-                    if not self._yolo_cancel:
-                        self.root.after(0, lambda: self._apply_combined_mask(wait_win, combined))
-                else:
-                    # 全フレーム一括処理
-                    total = self.video_total_frames
-                    w, h = self.original_image.size
-                    self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-
-                    applied_frames = 0
-                    for fi in range(total):
-                        if self._yolo_cancel:
-                            break
-                        ret, frame_bgr = self.video_cap.read()
-                        if not ret:
-                            break
-
-                        # cv2 から取得した frame_bgr をそのまま渡す（ultralytics は BGR を期待）
-                        combined = np.zeros((h, w), dtype=np.uint8)
-                        for m in all_models:
-                            try:
-                                combined = np.maximum(combined,
-                                    self._detect_to_mask(m, frame_bgr, conf, target_classes))
-                            except Exception:
-                                pass
-
-                        if np.any(combined):
-                            if self.video_masks.get(fi) is not None:
-                                self.video_masks[fi] = np.maximum(self.video_masks[fi], combined)
-                            else:
-                                self.video_masks[fi] = combined
-                            applied_frames += 1
-
-                        if fi % 5 == 0 or fi == total - 1:
-                            self.root.after(0, lambda f=fi: _safe_progress(f + 1))
-
-                    if not self._yolo_cancel:
-                        self.root.after(0, lambda: _on_batch_done(applied_frames))
-
+                pipeline = self._get_pipeline()
+                detections = pipeline.detect_and_segment(
+                    current_img,
+                    categories=cfg["categories"],
+                    generation_mode=cfg["mode"],
+                    use_segmenter=cfg["use_sam"],
+                    progress_cb=progress,
+                )
+                self.root.after(0, lambda: self._show_detection_results(wait_win, detections))
             except Exception as e:
-                err_msg = str(e)
-                self.root.after(0, lambda emsg=err_msg: self._yolo_error(wait_win, emsg))
+                err = str(e)
+                self.root.after(0, lambda: self._on_detect_error(wait_win, err))
 
-        def _on_batch_done(applied_count):
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _run_detect_all_video_frames(self, cfg: dict):
+        """動画の全フレームに検出を実行（バックグラウンド）。"""
+        total = self.video_total_frames
+        wait_win, status_label = self._show_progress_window(
+            "全フレーム検出中", "準備中...",
+            with_progress_bar=True, maximum=total,
+        )
+        bar = wait_win._progress_bar  # type: ignore
+        self._auto_cancel = False
+
+        tk.Button(wait_win, text="キャンセル",
+                  command=lambda: setattr(self, "_auto_cancel", True),
+                  relief="flat", padx=8).pack(pady=4)
+
+        def progress(msg: str):
+            self.root.after(0, lambda m=msg: status_label.config(text=m))
+
+        def set_bar(val: int):
             try:
-                wait_win.destroy()
+                if wait_win.winfo_exists():
+                    bar.config(value=val)
             except Exception:
                 pass
-            # カレントフレームの表示を再読み込みして反映
-            self.load_frame_at(self.video_frame_index)
-            messagebox.showinfo("一括検出完了", f"全 {self.video_total_frames} フレーム中、\n{applied_count} フレームにモザイクを適用しました。")
 
-        threading.Thread(target=detect_worker, daemon=True).start()
+        def worker():
+            applied = 0
+            try:
+                pipeline = self._get_pipeline()
+                self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                for fi in range(total):
+                    if self._auto_cancel:
+                        break
+                    ret, frame_bgr = self.video_cap.read()
+                    if not ret:
+                        break
+                    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                    img_pil = Image.fromarray(frame_rgb)
+                    self.root.after(0, lambda f=fi: status_label.config(
+                        text=f"フレーム {f + 1}/{total} を検出中..."))
+                    detections = pipeline.detect_and_segment(
+                        img_pil,
+                        categories=cfg["categories"],
+                        generation_mode=cfg["mode"],
+                        use_segmenter=cfg["use_sam"],
+                        progress_cb=None,
+                    )
+                    if detections:
+                        h, w = frame_bgr.shape[:2]
+                        mask = AutoMosaicPipeline.combine_masks(detections, (w, h))
+                        existing = self.video_masks.get(fi)
+                        self.video_masks[fi] = (
+                            np.maximum(existing, mask) if existing is not None else mask
+                        )
+                        applied += 1
+                    self.root.after(0, lambda v=fi + 1: set_bar(v))
+                self.root.after(0, lambda: self._finish_video_batch(wait_win, applied, total))
+            except Exception as e:
+                err = str(e)
+                self.root.after(0, lambda: self._on_detect_error(wait_win, err))
 
-    # ── 結果適用 ────────────────────────────────────────────
+        threading.Thread(target=worker, daemon=True).start()
 
-    def _apply_yolo_result(self, wait_win, results, model_path: str,
-                           orig_pil=None, target_classes: list = None,
-                           extra_results_list: list = None):
-        """検出結果をプレビューダイアログで確認後にマスクへ反映（seg/det両対応）"""
+    def _finish_video_batch(self, wait_win, applied: int, total: int):
         try:
             wait_win.destroy()
         except Exception:
             pass
+        self.load_frame_at(self.video_frame_index)
+        if self._auto_cancel:
+            messagebox.showinfo("キャンセル", f"{applied} フレーム適用済みでキャンセルしました")
+        else:
+            messagebox.showinfo("一括検出完了",
+                                f"全 {total} フレーム中、{applied} フレームに適用しました")
 
-        if self.mosaic_mask is None or self.original_image is None:
-            return
+    # ── 検出結果プレビュー ──────────────────────────────────
 
-        img_h, img_w = self.mosaic_mask.shape[:2]
-
-        # クラス名マップ
-        class_names: dict = {}
+    def _show_detection_results(self, wait_win, detections: List[dict]):
         try:
-            class_names = results[0].names
+            wait_win.destroy()
         except Exception:
             pass
-
-        # ── セグメンテーションマスクを解析 ──────────────────
-        candidates = []
-        has_seg = False
-        try:
-            masks_data = results[0].masks  # None if detection-only
-            boxes = results[0].boxes
-            if masks_data is not None and len(masks_data) > 0:
-                has_seg = True
-                # masks.data : (N, mask_h, mask_w) float tensor 0~1
-                seg_masks = masks_data.data.cpu().numpy()  # (N, mh, mw)
-                for i in range(len(seg_masks)):
-                    conf_val = float(boxes.conf[i]) if boxes is not None else 0.0
-                    cls_id   = int(boxes.cls[i]) if boxes is not None else 0
-                    cls_name = class_names.get(cls_id, str(cls_id))
-                    
-                    if target_classes and cls_name not in target_classes:
-                        continue
-
-                    # バウンディングボックス（表示用）
-                    xyxy = boxes.xyxy[i].tolist() if boxes is not None else [0, 0, img_w, img_h]
-                    bx1, by1, bx2, by2 = xyxy
-                    if max(abs(bx1), abs(by1), abs(bx2), abs(by2)) <= 1.0:
-                        bx1, by1 = bx1 * img_w, by1 * img_h
-                        bx2, by2 = bx2 * img_w, by2 * img_h
-                    x1 = max(0, min(img_w, int(min(bx1, bx2))))
-                    y1 = max(0, min(img_h, int(min(by1, by2))))
-                    x2 = max(0, min(img_w, int(max(bx1, bx2))))
-                    y2 = max(0, min(img_h, int(max(by1, by2))))
-
-                    candidates.append({
-                        "cls_id": cls_id,
-                        "cls_name": cls_name,
-                        "conf": conf_val,
-                        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                        "seg_idx": i,  # seg_masks のインデックス
-                    })
-            elif boxes is not None and len(boxes) > 0:
-                # detection only fallback
-                for i in range(len(boxes)):
-                    xyxy = boxes.xyxy[i].tolist()
-                    conf_val = float(boxes.conf[i])
-                    cls_id   = int(boxes.cls[i])
-                    cls_name = class_names.get(cls_id, str(cls_id))
-                    
-                    if target_classes and cls_name not in target_classes:
-                        continue
-                        
-                    bx1, by1, bx2, by2 = xyxy
-                    if max(abs(bx1), abs(by1), abs(bx2), abs(by2)) <= 1.0:
-                        bx1, by1 = bx1 * img_w, by1 * img_h
-                        bx2, by2 = bx2 * img_w, by2 * img_h
-                    x1 = max(0, min(img_w, int(min(bx1, bx2))))
-                    y1 = max(0, min(img_h, int(min(by1, by2))))
-                    x2 = max(0, min(img_w, int(max(bx1, bx2))))
-                    y2 = max(0, min(img_h, int(max(by1, by2))))
-                    if x2 <= x1 or y2 <= y1:
-                        continue
-                    candidates.append({
-                        "cls_id": cls_id, "cls_name": cls_name, "conf": conf_val,
-                        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                        "seg_idx": None,
-                    })
-        except Exception as e:
-            messagebox.showerror("YOLO エラー", f"結果の解析に失敗しました:\n{e}")
+        if self.mosaic_mask is None or self.original_image is None:
             return
-
-        model_name = os.path.basename(model_path)
-        mode_label = "セグメント" if has_seg else "バウンディングボックス"
-
-        if not candidates:
+        if not detections:
             messagebox.showinfo(
-                f"自動検出 (YOLO / {model_name}) — 0件",
-                "検出結果が見つかりませんでした。\n\n"
-                "・信頼度が低い可能性があります（閾値を下げてみてください）。\n"
-                f"・使用モデル: {model_name}\n"
-                f"・画像サイズ: {img_w}x{img_h}px"
+                "自動検出",
+                "検出結果がありませんでした。\n"
+                "・カテゴリ選択を見直す\n"
+                "・検出強度を slow に上げる\n"
+                "等を試してください。"
             )
             return
 
-        # ── プレビューダイアログ ─────────────────────────────
         dlg = tk.Toplevel(self.root)
-        dlg.title(f"検出結果 ({len(candidates)}件 / {mode_label}) — {model_name}")
-        dlg.geometry("560x400")
+        dlg.title(f"検出結果 ({len(detections)}件)")
+        dlg.geometry("560x420")
         dlg.grab_set()
 
-        tk.Label(dlg, text="チェックしたものをモザイク選択範囲に追加します",
-                 font=("", 9), fg="gray").pack(pady=(6, 0))
-        tk.Label(dlg, text=f"モデル: {model_name}  [{mode_label}]",
-                 font=("", 8), fg="#666666").pack()
+        tk.Label(dlg, text="チェックした項目をモザイク範囲に追加します",
+                 font=("", 9), fg="gray").pack(pady=(6, 2))
 
         frm = tk.Frame(dlg)
         frm.pack(fill="both", expand=True, padx=10, pady=4)
-
         canvas_sc = tk.Canvas(frm)
         scrollbar = ttk.Scrollbar(frm, orient="vertical", command=canvas_sc.yview)
         inner = tk.Frame(canvas_sc)
@@ -2068,16 +1791,15 @@ class MosaicEditor:
         scrollbar.pack(side="right", fill="y")
 
         vars_ = []
-        for c in candidates:
+        for d in detections:
             v = tk.BooleanVar(value=True)
             vars_.append(v)
-            seg_tag = "[seg]" if c["seg_idx"] is not None else "[box]"
+            x1, y1, x2, y2 = d["bbox"]
+            seg_tag = "[seg]" if d.get("mask") is not None else "[box]"
             tk.Checkbutton(
                 inner,
-                text=f"{seg_tag} {c['cls_name']}  conf={c['conf']:.0%}  "
-                     f"({c['x1']},{c['y1']})-({c['x2']},{c['y2']})",
-                variable=v,
-                anchor="w",
+                text=f"{seg_tag} {d['label']}  ({x1},{y1})-({x2},{y2})",
+                variable=v, anchor="w",
             ).pack(fill="x", padx=6, pady=1)
 
         btn_frame = tk.Frame(dlg)
@@ -2089,611 +1811,165 @@ class MosaicEditor:
             dlg.destroy()
 
         tk.Button(btn_frame, text="選択範囲に追加", command=on_apply,
-                  bg="#3a7bd5", fg="white", relief="flat", padx=10, pady=4).pack(side="left", padx=6)
+                  bg="#3a7bd5", fg="white", relief="flat",
+                  padx=10, pady=4).pack(side="left", padx=6)
         tk.Button(btn_frame, text="キャンセル", command=dlg.destroy,
                   relief="flat", padx=10, pady=4).pack(side="left", padx=6)
 
         dlg.wait_window()
-
         if not result["ok"]:
             return
 
-        # ── マスクへ反映 ──────────────────────────────────────
+        h, w = self.mosaic_mask.shape[:2]
         applied = 0
-        seg_masks_np = None
-        if has_seg:
-            try:
-                seg_masks_np = results[0].masks.data.cpu().numpy()
-            except Exception:
-                seg_masks_np = None
-
-        for v, c in zip(vars_, candidates):
+        for v, d in zip(vars_, detections):
             if not v.get():
                 continue
-            idx = c["seg_idx"]
-            if has_seg and seg_masks_np is not None and idx is not None:
-                # セグメントマスクを元画像サイズにリサイズして適用
-                mask_f = seg_masks_np[idx]  # (mh, mw) float 0~1
-                mask_u8 = (mask_f * 255).astype(np.uint8)
-                mask_resized = cv2.resize(mask_u8, (img_w, img_h),
-                                          interpolation=cv2.INTER_LINEAR)
-                self.mosaic_mask[mask_resized > 127] = 255
+            mask = d.get("mask")
+            if mask is not None and mask.shape == (h, w):
+                self.mosaic_mask[mask > 127] = 255
             else:
-                # バウンディングボックスで矩形塗り
-                self.mosaic_mask[c["y1"]:c["y2"], c["x1"]:c["x2"]] = 255
+                x1, y1, x2, y2 = d["bbox"]
+                self.mosaic_mask[y1:y2, x1:x2] = 255
             applied += 1
-
-        # ── 追加モデルの結果を自動適用 ──────────────────────────
-        extra_applied = 0
-        if extra_results_list:
-            for extra_res in extra_results_list:
-                try:
-                    ex_boxes = extra_res[0].boxes
-                    ex_masks_data = extra_res[0].masks
-                    ex_class_names = extra_res[0].names
-                    ex_conf = getattr(self, '_yolo_conf', 0.3)
-                    if ex_masks_data is not None and len(ex_masks_data) > 0:
-                        ex_segs = ex_masks_data.data.cpu().numpy()
-                        for i in range(len(ex_segs)):
-                            cls_id = int(ex_boxes.cls[i]) if ex_boxes is not None else 0
-                            cls_name = ex_class_names.get(cls_id, str(cls_id))
-                            if target_classes and cls_name not in target_classes:
-                                continue
-                            if float(ex_boxes.conf[i]) >= ex_conf:
-                                mf = ex_segs[i]
-                                mu8 = (mf * 255).astype(np.uint8)
-                                mres = cv2.resize(mu8, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
-                                self.mosaic_mask[mres > 127] = 255
-                                extra_applied += 1
-                    elif ex_boxes is not None and len(ex_boxes) > 0:
-                        for i in range(len(ex_boxes)):
-                            cls_id = int(ex_boxes.cls[i])
-                            cls_name = ex_class_names.get(cls_id, str(cls_id))
-                            if target_classes and cls_name not in target_classes:
-                                continue
-                            if float(ex_boxes.conf[i]) >= ex_conf:
-                                xyxy = ex_boxes.xyxy[i].tolist()
-                                bx1, by1, bx2, by2 = xyxy
-                                if max(abs(bx1), abs(by1), abs(bx2), abs(by2)) <= 1.0:
-                                    bx1, by1 = bx1 * img_w, by1 * img_h
-                                    bx2, by2 = bx2 * img_w, by2 * img_h
-                                x1 = max(0, min(img_w, int(min(bx1, bx2))))
-                                y1 = max(0, min(img_h, int(min(by1, by2))))
-                                x2 = max(0, min(img_w, int(max(bx1, bx2))))
-                                y2 = max(0, min(img_h, int(max(by1, by2))))
-                                if x2 > x1 and y2 > y1:
-                                    self.mosaic_mask[y1:y2, x1:x2] = 255
-                                    extra_applied += 1
-                except Exception:
-                    pass
-
         self.show_mask.set(True)
         self.update_view()
-
-        extra_msg = f"\n追加モデル自動適用: {extra_applied} 箇所" if extra_applied > 0 else ""
-        messagebox.showinfo(
-            "適用完了",
-            f"{applied} 箇所をモザイク選択範囲に追加しました。\n"
-            f"({mode_label}モードで適用){extra_msg}\n"
-            "ペン・魔法の杖・消しゴムで微調整してから保存してください。"
-        )
-
-    def _yolo_error(self, wait_win, err: str):
-        try:
-            wait_win.destroy()
-        except Exception:
-            pass
-        messagebox.showerror("YOLO エラー", f"検出中にエラーが発生しました:\n{err}")
-
-    # ── モデルキャッシュ ────────────────────────────────────────
-
-    def _get_cached_yolo(self, model_path: str):
-        """YOLOモデルをキャッシュして再ロードのコストを省く。"""
-        if model_path not in self._yolo_model_cache:
-            from ultralytics import YOLO  # type: ignore
-            m = YOLO(model_path)
-            self._yolo_model_cache[model_path] = m
-        return self._yolo_model_cache[model_path]
-
-    # ── タイリング推論ヘルパー ──────────────────────────────────
-
-    def _detect_to_mask(self, model, img_np: np.ndarray, conf: float,
-                        target_classes, tile_size: int = 1024) -> np.ndarray:
-        """1モデル・1画像で推論。大きい画像はタイルをバッチ推論。マスク(H,W uint8)を返す。
-
-        img_np は **BGR** (cv2/ultralytics 規約) を期待する。RGB を渡すとチャネル順が
-        ずれて検出精度が大きく低下する。
-
-        重点クラス (_YOLO_PRIORITY_CLASSES) は実効しきい値を下げてリコール重視で
-        判定し、それ以外のクラスはユーザー指定 conf をそのまま要求する。
-        """
-        h, w = img_np.shape[:2]
-        mask = np.zeros((h, w), dtype=np.uint8)
-        self._yolo_last_errors = []
-
-        # 重点クラス用の低いしきい値: ユーザー設定 conf より 0.2 下げて取りこぼしを抑える。
-        # 推論時には min(conf, priority_conf) を YOLO に渡し、候補を多めに受け取った上で
-        # クラスごとに必要な信頼度を満たすか自分でフィルタする。
-        priority_conf = max(0.25, conf - 0.2)
-        model_conf = min(conf, priority_conf)
-
-        # GPU が使えるなら FP16 で速度向上
-        try:
-            import torch
-            use_half = torch.cuda.is_available()
-        except Exception:
-            use_half = False
-
-        def _draw_polygon(pts, ox, oy):
-            if len(pts) < 3:
-                return
-            pts_f = pts.astype(np.float32).copy()
-            pts_f[:, 0] = np.clip(pts_f[:, 0] + ox, 0, w - 1)
-            pts_f[:, 1] = np.clip(pts_f[:, 1] + oy, 0, h - 1)
-            pts_cv = pts_f.astype(np.int32).reshape((-1, 1, 2))
-            cv2.fillPoly(mask, [pts_cv], 255)
-
-        def _required_conf(cname: str) -> float:
-            return priority_conf if cname in self._YOLO_PRIORITY_CLASSES else conf
-
-        def _apply_single(result, ox: int, oy: int):
-            """単一 Result オブジェクトをマスクに描画する。"""
-            try:
-                boxes = result.boxes
-                mdata = result.masks
-                names = result.names
-            except Exception as e:
-                self._yolo_last_errors.append(f"結果取得エラー: {e}")
-                return
-
-            if mdata is not None and len(mdata) > 0:
-                try:
-                    polygons = mdata.xy
-                except Exception as e:
-                    self._yolo_last_errors.append(f"mdata.xy エラー: {e}")
-                    polygons = []
-                for i, pts in enumerate(polygons):
-                    try:
-                        if boxes is None or i >= len(boxes):
-                            continue
-                        cid = int(boxes.cls[i])
-                        cname = names.get(cid, str(cid))
-                        if target_classes and cname not in target_classes:
-                            continue
-                        if float(boxes.conf[i]) < _required_conf(cname):
-                            continue
-                        _draw_polygon(pts, ox, oy)
-                    except Exception as e:
-                        self._yolo_last_errors.append(f"polygon[{i}]: {e}")
-            elif boxes is not None and len(boxes) > 0:
-                for i in range(len(boxes)):
-                    try:
-                        cid = int(boxes.cls[i])
-                        cname = names.get(cid, str(cid))
-                        if target_classes and cname not in target_classes:
-                            continue
-                        if float(boxes.conf[i]) < _required_conf(cname):
-                            continue
-                        bx1, by1, bx2, by2 = boxes.xyxy[i].tolist()
-                        x1 = max(0, min(w, ox + int(min(bx1, bx2))))
-                        y1 = max(0, min(h, oy + int(min(by1, by2))))
-                        x2 = max(0, min(w, ox + int(max(bx1, bx2))))
-                        y2 = max(0, min(h, oy + int(max(by1, by2))))
-                        if x2 > x1 and y2 > y1:
-                            mask[y1:y2, x1:x2] = 255
-                    except Exception as e:
-                        self._yolo_last_errors.append(f"bbox[{i}]: {e}")
-
-        infer_imgsz = 1024
-        long_side = max(w, h)
-        infer_kwargs = dict(verbose=False, conf=model_conf, imgsz=infer_imgsz, half=use_half)
-
-        if long_side <= tile_size * 1.5:
-            # 画像全体を1回で推論
-            try:
-                results = model(img_np, **infer_kwargs)
-                _apply_single(results[0], 0, 0)
-            except Exception as e:
-                self._yolo_last_errors.append(f"推論エラー: {e}")
-        else:
-            # タイルをまとめてバッチ推論（1回のフォワードパスで処理）
-            stride = int(tile_size * 0.75)
-            tiles: list = []
-            coords: list = []
-            for ty in range(0, h, stride):
-                for tx in range(0, w, stride):
-                    tx2 = min(tx + tile_size, w)
-                    ty2 = min(ty + tile_size, h)
-                    tx1 = max(0, tx2 - tile_size)
-                    ty1 = max(0, ty2 - tile_size)
-                    tiles.append(img_np[ty1:ty2, tx1:tx2])
-                    coords.append((tx1, ty1))
-
-            # GPU VRAM を考慮して最大4枚ずつバッチ処理
-            batch_size = 4
-            for b in range(0, len(tiles), batch_size):
-                batch = tiles[b:b + batch_size]
-                bcoords = coords[b:b + batch_size]
-                try:
-                    results = model(batch, **infer_kwargs)
-                    for result, (ox, oy) in zip(results, bcoords):
-                        _apply_single(result, ox, oy)
-                except Exception as e:
-                    self._yolo_last_errors.append(f"バッチ推論エラー: {e}")
-
-        return mask
-
-    def _apply_combined_mask(self, wait_win, combined_mask: np.ndarray):
-        """単一フレーム検出の結果マスクを適用してサマリを表示"""
-        try:
-            wait_win.destroy()
-        except Exception:
-            pass
-        if self.mosaic_mask is None:
-            return
-        if not np.any(combined_mask):
-            errors = getattr(self, '_yolo_last_errors', [])
-            error_detail = ""
-            if errors:
-                error_detail = "\n\n--- エラー詳細 ---\n" + "\n".join(errors[:5])
-            messagebox.showinfo(
-                "自動検出",
-                f"検出結果が見つかりませんでした。\n"
-                f"・閾値を下げてみてください（現在の推奨: 0.5〜0.8）\n"
-                f"・対象クラスが選択されているか確認してください{error_detail}"
-            )
-            return
-        self.mosaic_mask = np.maximum(self.mosaic_mask, combined_mask)
-        self.show_mask.set(True)
-        self.update_view()
-        px = int(np.sum(combined_mask > 0))
         messagebox.showinfo("適用完了",
-                            f"検出領域をモザイク選択範囲に追加しました。\n"
-                            f"(適用ピクセル数: {px:,})\n"
-                            "ペン・消しゴムで微調整してから保存してください。")
+                            f"{applied} 箇所を選択範囲に追加しました。\n"
+                            "ペン・魔法の杖・消しゴムで微調整してから保存してください。")
 
-    # ================= フォルダ一括自動検出 =================
+    def _on_detect_error(self, wait_win, err: str):
+        try:
+            wait_win.destroy()
+        except Exception:
+            pass
+        messagebox.showerror("検出エラー",
+                             f"検出中にエラーが発生しました:\n{err}")
+
+    def _show_progress_window(self, title: str, msg: str,
+                              with_progress_bar: bool = False,
+                              maximum: int = 100):
+        """検出中の待機ダイアログを生成し (window, status_label) を返す。"""
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.geometry("420x160")
+        win.resizable(False, False)
+        win.grab_set()
+
+        status_label = tk.Label(win, text=msg, pady=8, wraplength=400,
+                                justify="left", font=("", 9))
+        status_label.pack(fill="x", padx=10)
+
+        if with_progress_bar:
+            bar = ttk.Progressbar(win, maximum=max(1, maximum), length=380)
+            bar.pack(padx=20, pady=4)
+            win._progress_bar = bar  # type: ignore
+        else:
+            bar = ttk.Progressbar(win, mode="indeterminate", length=380)
+            bar.pack(padx=20, pady=4)
+            bar.start(10)
+
+        return win, status_label
+
+    # ── フォルダ一括 ────────────────────────────────────────
 
     def _offer_folder_auto_detect(self):
-        """フォルダ読込後に自動検出をオファーする。YOLOモデルが見つからなければ何もしない。"""
+        """フォルダ読み込み後に一括自動検出をオファーする。"""
         if not self.image_list:
             return
-        # 画像ファイルのみ対象
         img_files = [p for p in self.image_list if p.lower().endswith(SUPPORTED_EXT)]
         if not img_files:
             return
-        # YOLOモデルを自動探索（ダイアログは出さない）
-        model_path = None
-        if hasattr(self, '_yolo_model_path') and self._yolo_model_path:
-            if os.path.isfile(self._yolo_model_path):
-                model_path = self._yolo_model_path
-        if model_path is None:
-            model_path = self._find_yolo_model()
-        if model_path is None:
-            return  # モデルが無ければ静かにスキップ
 
-        # 利用可能な全モデル
-        all_available_models = [p for p in ADDITIONAL_YOLO_MODELS if os.path.isfile(p)]
-        if model_path and model_path not in all_available_models and os.path.isfile(model_path):
-            all_available_models = [model_path] + all_available_models
-
-        # 確認ダイアログ
-        conf_dlg = tk.Toplevel(self.root)
-        conf_dlg.title("自動モザイク")
-        conf_dlg.geometry("440x420")
-        conf_dlg.resizable(False, False)
-        conf_dlg.grab_set()
-
-        tk.Label(conf_dlg,
-                 text=f"フォルダ内の画像 {len(img_files)} 枚に\n自動モザイク (YOLO) を適用しますか？",
-                 font=("", 10), pady=8).pack()
-
-        # ── モデル選択 ─────────────────────────────────────────
-        tk.Label(conf_dlg, text="使用モデル:", font=("", 9)).pack(pady=(2, 0))
-        model_sel_frm = tk.Frame(conf_dlg)
-        model_sel_frm.pack()
-        prev_choice = getattr(self, '_yolo_selected_choice', 'all')
-        valid_choices = ["all"] + all_available_models
-        if prev_choice not in valid_choices:
-            prev_choice = "all"
-        model_choice_var = tk.StringVar(value=prev_choice)
-
-        if len(all_available_models) >= 2:
-            tk.Radiobutton(model_sel_frm, text="両方", variable=model_choice_var,
-                           value="all").pack(side="left", padx=2)
-        for p in all_available_models:
-            tk.Radiobutton(model_sel_frm, text=os.path.basename(p),
-                           variable=model_choice_var, value=p).pack(side="left", padx=2)
-
-        tk.Label(conf_dlg, text="信頼度閾値:", font=("", 9)).pack(pady=(6, 0))
-        conf_var = tk.DoubleVar(value=getattr(self, '_yolo_conf', 0.5))
-        tk.Scale(conf_dlg, from_=0.1, to=1.0, resolution=0.05,
-                 variable=conf_var, orient=tk.HORIZONTAL, length=320,
-                 showvalue=True).pack()
-
-        # ── 対象クラス選択（モデル変更で動的に再構築） ─────────
-        tk.Label(conf_dlg, text="検出対象クラス:", font=("", 9)).pack(pady=(6, 0))
-        cls_frm = tk.Frame(conf_dlg)
-        cls_frm.pack(pady=2)
-
-        if not hasattr(self, '_batch_target_classes'):
-            self._batch_target_classes = {}
-
-        batch_cls_vars: dict = {}
-
-        def _resolve_paths_for_choice(choice: str) -> list:
-            if choice == "all":
-                return list(all_available_models)
-            return [choice] if choice in all_available_models else list(all_available_models)
-
-        def _rebuild_cls_checkboxes(*_):
-            for w in cls_frm.winfo_children():
-                w.destroy()
-            batch_cls_vars.clear()
-
-            paths = _resolve_paths_for_choice(model_choice_var.get())
-            discovered = self._gather_target_class_names(paths)
-
-            for cname in discovered:
-                if cname not in self._batch_target_classes:
-                    self._batch_target_classes[cname] = cname in self._YOLO_DEFAULT_ON_CLASSES
-
-            if discovered:
-                row, col = 0, 0
-                for cname in discovered:
-                    var = tk.BooleanVar(value=self._batch_target_classes.get(cname, False))
-                    batch_cls_vars[cname] = var
-                    tk.Checkbutton(cls_frm, text=cname, variable=var).grid(row=row, column=col, sticky="w", padx=4)
-                    col += 1
-                    if col > 2:
-                        col = 0
-                        row += 1
-            else:
-                tk.Label(cls_frm, text="(クラス情報を取得できませんでした — 全クラスを対象にします)",
-                         font=("", 8), fg="#888888").pack()
-
-        _rebuild_cls_checkboxes()
-        model_choice_var.trace_add("write", _rebuild_cls_checkboxes)
-
-        overwrite_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(conf_dlg, text="既存のマスクも上書きする",
-                       variable=overwrite_var).pack(pady=(4, 0))
-
-        btn_frm = tk.Frame(conf_dlg)
-        btn_frm.pack(pady=8)
-        do_run = {"ok": False}
-
-        def on_yes():
-            do_run["ok"] = True
-            conf_dlg.destroy()
-
-        tk.Button(btn_frm, text="はい、適用する", command=on_yes,
-                  bg="#3a7bd5", fg="white", relief="flat",
-                  padx=12, pady=4).pack(side="left", padx=6)
-        tk.Button(btn_frm, text="スキップ", command=conf_dlg.destroy,
-                  relief="flat", padx=8, pady=4).pack(side="left", padx=6)
-
-        conf_dlg.wait_window()
-        if not do_run["ok"]:
+        cfg = self._build_detect_config_dialog(
+            "自動モザイク (フォルダ一括)",
+            folder_mode=True,
+            folder_image_count=len(img_files),
+        )
+        if cfg is None:
+            return
+        if not cfg["categories"]:
+            messagebox.showwarning("自動検出", "検出対象クラスを1つ以上選んでください")
             return
 
-        conf = conf_var.get()
-        self._yolo_conf = conf
-        overwrite = overwrite_var.get()
+        def _go():
+            self._run_detect_folder_batch(img_files, cfg)
 
-        # モデル選択を記憶
-        choice = model_choice_var.get()
-        self._yolo_selected_choice = choice
-        selected_models = _resolve_paths_for_choice(choice)
-        if selected_models:
-            model_path = selected_models[0]
+        self._ensure_deps(_go)
 
-        # 選択されたクラスを記憶・取得
-        target_classes = [cname for cname, var in batch_cls_vars.items() if var.get()]
-        for cname in batch_cls_vars:
-            self._batch_target_classes[cname] = cname in target_classes
-
-        # ultralyticsが入っていなければインストール確認
-        try:
-            import ultralytics  # type: ignore  # noqa: F401
-            self._auto_detect_folder_batch(model_path, img_files, conf, overwrite,
-                                           target_classes, selected_models=selected_models)
-        except ImportError:
-            if messagebox.askyesno(
-                "ultralytics 自動インストール",
-                "ultralytics がインストールされていません。\n自動的にインストールしますか？"
-            ):
-                self._install_and_folder_batch(model_path, img_files, conf, overwrite,
-                                               target_classes, selected_models=selected_models)
-
-    def _install_and_folder_batch(self, model_path, img_files, conf, overwrite, target_classes=None, selected_models: list = None):
-        """ultralyticsをインストールして一括検出を実行"""
-        import subprocess, queue
-        progress_win = tk.Toplevel(self.root)
-        progress_win.title("ultralytics インストール中")
-        progress_win.geometry("520x300")
-        progress_win.resizable(True, True)
-        progress_win.grab_set()
-        tk.Label(progress_win, text="ultralytics をインストール中...",
-                 font=("", 10, "bold"), pady=6).pack()
-        bar = ttk.Progressbar(progress_win, mode="indeterminate", length=490)
-        bar.pack(padx=10)
-        bar.start(12)
-        frame = tk.Frame(progress_win)
-        frame.pack(fill="both", expand=True, padx=10, pady=6)
-        log_text = tk.Text(frame, height=12, wrap="word", state="disabled",
-                           bg="#1e1e1e", fg="#cccccc", font=("Consolas", 9))
-        log_text.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(frame, command=log_text.yview)
-        sb.pack(side="right", fill="y")
-        log_text.config(yscrollcommand=sb.set)
-        log_queue: "queue.Queue[str]" = __import__("queue").Queue()
-
-        def append_log(line):
-            log_text.config(state="normal")
-            log_text.insert("end", line)
-            log_text.see("end")
-            log_text.config(state="disabled")
-
-        def poll_queue():
-            try:
-                while True:
-                    line = log_queue.get_nowait()
-                    append_log(line)
-            except __import__("queue").Empty:
-                pass
-            if progress_win.winfo_exists():
-                progress_win.after(100, poll_queue)
-
-        def do_install():
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "pip", "install", "--upgrade", "--no-cache-dir", "ultralytics"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace"
-            )
-            for line in proc.stdout:
-                log_queue.put(line)
-            proc.wait()
-            if proc.returncode == 0:
-                log_queue.put("\n✅ インストール完了！検出を開始します。\n")
-                self.root.after(0, lambda: (progress_win.destroy(),
-                                            self._auto_detect_folder_batch(model_path, img_files, conf, overwrite,
-                                                                            target_classes, selected_models=selected_models)))
-            else:
-                log_queue.put("❌ インストール失敗\n")
-
-        progress_win.after(100, poll_queue)
-        threading.Thread(target=do_install, daemon=True).start()
-
-    def _auto_detect_folder_batch(self, model_path: str, img_files: list,
-                                   conf: float = 0.5, overwrite: bool = False,
-                                   target_classes: list = None,
-                                   selected_models: list = None):
-        """全画像にYOLO自動検出を実行してマスクNPZを保存する
-
-        selected_models: 使用するモデルパスのリスト。None なら ADDITIONAL_YOLO_MODELS をフォールバックとして使用。
-        """
+    def _run_detect_folder_batch(self, img_files: List[str], cfg: dict):
         total = len(img_files)
+        wait_win, status_label = self._show_progress_window(
+            "フォルダ一括検出中", "準備中...",
+            with_progress_bar=True, maximum=total,
+        )
+        bar = wait_win._progress_bar  # type: ignore
+        self._auto_cancel = False
 
-        wait_win = tk.Toplevel(self.root)
-        wait_win.title("フォルダ一括自動検出中...")
-        wait_win.geometry("400x140")
-        wait_win.resizable(False, False)
-        wait_win.grab_set()
-        tk.Label(wait_win, text="全画像にYOLO自動モザイクを適用中...", pady=8).pack()
-        bar = ttk.Progressbar(wait_win, maximum=total, length=360)
-        bar.pack(padx=20)
-        pct_label = tk.Label(wait_win, text=f"0 / {total}", font=("", 9))
-        pct_label.pack(pady=2)
+        tk.Button(wait_win, text="キャンセル",
+                  command=lambda: setattr(self, "_auto_cancel", True),
+                  relief="flat", padx=8).pack(pady=4)
 
-        self._batch_cancel = False
-
-        def _cancel():
-            self._batch_cancel = True
+        def set_bar(val: int):
             try:
-                wait_win.destroy()
-            except Exception:
-                pass
-
-        tk.Button(wait_win, text="キャンセル", command=_cancel,
-                  relief="flat", padx=8, pady=2).pack(pady=4)
-
-        def _safe_progress(value):
-            # キャンセル後にコールバックが残っていてもクラッシュしないように
-            try:
-                if not wait_win.winfo_exists():
-                    return
-                bar.config(value=value)
-                pct_label.config(text=f"{value} / {total}")
+                if wait_win.winfo_exists():
+                    bar.config(value=val)
             except Exception:
                 pass
 
         def worker():
+            applied = 0
             try:
-                # 使用するモデル群を決定
-                if selected_models:
-                    target_paths = [p for p in selected_models if os.path.isfile(p)]
-                else:
-                    fixed_existing = [p for p in ADDITIONAL_YOLO_MODELS if os.path.isfile(p)]
-                    main_path = fixed_existing[0] if fixed_existing else model_path
-                    target_paths = [main_path] + [p for p in ADDITIONAL_YOLO_MODELS
-                                                   if os.path.isfile(p) and p != main_path]
-
-                all_models = []
-                for ep in target_paths:
-                    try:
-                        all_models.append(self._get_cached_yolo(ep))
-                    except Exception:
-                        pass
-                if not all_models:
-                    try:
-                        all_models = [self._get_cached_yolo(model_path)]
-                    except Exception as e:
-                        self.root.after(0, lambda emsg=str(e): _on_error(
-                            f"モデル読み込みに失敗しました:\n{emsg}"))
-                        return
-                applied = 0
-
+                pipeline = self._get_pipeline()
                 for fi, img_path in enumerate(img_files):
-                    if self._batch_cancel:
+                    if self._auto_cancel:
                         break
-
                     mask_path = self.get_mask_path(img_path)
-                    if not overwrite and mask_path and os.path.exists(mask_path):
-                        self.root.after(0, lambda f=fi: _safe_progress(f + 1))
+                    if not cfg["overwrite"] and mask_path and os.path.exists(mask_path):
+                        self.root.after(0, lambda v=fi + 1: set_bar(v))
                         continue
-
+                    self.root.after(0, lambda f=fi, p=img_path: status_label.config(
+                        text=f"[{f + 1}/{total}] {os.path.basename(p)}"))
                     try:
                         img_pil = Image.open(img_path).convert("RGB")
-                        img_rgb = np.array(img_pil)
-                        # ultralytics は BGR を期待するため変換
-                        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-                        h, w = img_bgr.shape[:2]
                     except Exception:
+                        self.root.after(0, lambda v=fi + 1: set_bar(v))
                         continue
-
-                    combined = np.zeros((h, w), dtype=np.uint8)
-                    for m in all_models:
-                        try:
-                            combined = np.maximum(combined,
-                                self._detect_to_mask(m, img_bgr, conf, target_classes))
-                        except Exception:
-                            pass
-
-                    if np.any(combined) and mask_path:
-                        np.savez_compressed(mask_path, mask=combined)
-                        applied += 1
-
-                    self.root.after(0, lambda f=fi: _safe_progress(f + 1))
-
-                self.root.after(0, lambda: _on_done(applied))
-
+                    detections = pipeline.detect_and_segment(
+                        img_pil,
+                        categories=cfg["categories"],
+                        generation_mode=cfg["mode"],
+                        use_segmenter=cfg["use_sam"],
+                        progress_cb=None,
+                    )
+                    if detections and mask_path:
+                        w, h = img_pil.size
+                        combined = AutoMosaicPipeline.combine_masks(detections, (w, h))
+                        if np.any(combined):
+                            np.savez_compressed(mask_path, mask=combined)
+                            applied += 1
+                    self.root.after(0, lambda v=fi + 1: set_bar(v))
+                self.root.after(0, lambda: self._finish_folder_batch(
+                    wait_win, applied, total))
             except Exception as e:
-                err_msg = str(e)
-                self.root.after(0, lambda emsg=err_msg: _on_error(emsg))
-
-        def _on_done(applied_count):
-            try:
-                wait_win.destroy()
-            except Exception:
-                pass
-            # 現在表示中の画像にマスクを反映
-            if not self._batch_cancel:
-                self.load_current_file()
-                messagebox.showinfo(
-                    "一括検出完了",
-                    f"全 {total} 枚中、{applied_count} 枚にモザイクを適用しました。\n"
-                    "手動で範囲を微調整してから保存してください。"
-                )
-
-        def _on_error(err):
-            try:
-                wait_win.destroy()
-            except Exception:
-                pass
-            messagebox.showerror("自動検出エラー", f"一括検出中にエラーが発生しました:\n{err}")
+                err = str(e)
+                self.root.after(0, lambda: self._on_detect_error(wait_win, err))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_folder_batch(self, wait_win, applied: int, total: int):
+        try:
+            wait_win.destroy()
+        except Exception:
+            pass
+        self.load_current_file()
+        if self._auto_cancel:
+            messagebox.showinfo("キャンセル", f"{applied}/{total} 枚適用済みでキャンセルしました")
+        else:
+            messagebox.showinfo("一括検出完了",
+                                f"全 {total} 枚中、{applied} 枚にモザイクを適用しました。\n"
+                                "手動で範囲を微調整してから保存してください。")
+
 
 def _ensure_tkinterdnd2():
     """tkinterdnd2がなければ自動インストールしてからimportする"""

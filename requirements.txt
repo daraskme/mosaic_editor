@@ -1,4 +1,9 @@
 Pillow
 numpy
 opencv-python
-ultralytics
+# 自動検出 (LocateAnything-3B + SAM)
+torch
+torchvision
+transformers>=4.57.1
+peft
+accelerate

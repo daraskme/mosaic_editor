@@ -43,9 +43,6 @@ Thumbs.db
 # Specific folders
 civitai/
 
-# COCO YOLO base models (downloaded automatically by ultralytics during testing)
-yolov8n.pt
-yolov8s.pt
-yolov8m.pt
-yolov8l.pt
-yolov8x.pt
+# Detection model checkpoints (downloaded to HF cache, but ignore stray local copies)
+*.pt
+*.safetensors
