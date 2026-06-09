@@ -46,3 +46,6 @@ civitai/
 # Detection model checkpoints (downloaded to HF cache, but ignore stray local copies)
 *.pt
 *.safetensors
+
+# LocateAnything 用の隔離 transformers (自動生成)
+vendor/

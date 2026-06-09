@@ -71,7 +71,7 @@ class Sam3ConceptSegmenter:
                     progress_cb(f"SAM3 検出中 [{done}/{n_total}] 「{prompt}」...")
                 inputs = self.processor(
                     images=image, text=prompt, return_tensors="pt"
-                ).to(self.device)
+                ).to(self.device, dtype=self.dtype)
                 with torch.no_grad():
                     outputs = self.model(**inputs)
                 results = self.processor.post_process_instance_segmentation(

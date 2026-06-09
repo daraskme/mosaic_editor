@@ -123,7 +123,9 @@ python mosaic.py
 
 ## 技術メモ
 
-- LocateAnything-3B の remote code は transformers 4.57.1 向けのため、
-  v5 で動かす互換パッチを `mosaic_editor/detect/locate_anything.py` で適用しています
+- LocateAnything-3B の remote code は transformers 4.57.1 専用で、SAM3 が必要とする
+  v5 系とは同一プロセスで共存できません。そのため transformers 4.57.1 を
+  `vendor/transformers_la/` に隔離インストールし (初回利用時に自動)、
+  推論は常駐サブプロセス `la_worker.py` で実行しています
 - 検出はバックエンド非依存の `Detection` 型に正規化され、
   `DetectionPipeline.combine_masks()` で1枚のマスクに統合されます

@@ -56,9 +56,7 @@ class Sam3BoxRefiner:
             images=image,
             input_boxes=[[[float(x1), float(y1), float(x2), float(y2)]]],
             return_tensors="pt",
-        ).to(self.device)
-        if "pixel_values" in inputs:
-            inputs["pixel_values"] = inputs["pixel_values"].to(self.dtype)
+        ).to(self.device, dtype=self.dtype)
         with torch.no_grad():
             outputs = self.model(**inputs)
 
