@@ -1,9 +1,19 @@
+# 基本 (編集機能のみならこれだけで動作)
 Pillow
 numpy
 opencv-python
-# 自動検出 (LocateAnything-3B + SAM)
+tkinterdnd2
+
+# 自動検出 (SAM3 / LocateAnything-3B)
+# GPU 環境では torch を CUDA ビルドで入れること:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 torch
 torchvision
-transformers>=4.57.1
-peft
+transformers>=5.0.0
 accelerate
+
+# LocateAnything-3B の remote code が要求する依存
+peft
+decord
+lmdb
+requests
