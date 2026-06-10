@@ -40,16 +40,25 @@ _BOX_RE = re.compile(
 
 
 def _ensure_vendor_transformers(progress_cb: ProgressCB = None) -> None:
-    """vendor/transformers_la に transformers==4.57.1 を隔離インストールする."""
-    if os.path.isdir(os.path.join(VENDOR_DIR, "transformers")):
-        return
-    if progress_cb:
-        progress_cb("LocateAnything 用に transformers 4.57.1 を準備中...")
-    subprocess.check_call([
-        sys.executable, "-m", "pip", "install",
-        "--target", VENDOR_DIR,
-        "transformers==4.57.1", "huggingface_hub<1.0",
-    ])
+    """vendor/transformers_la に transformers==4.57.1 を隔離インストールする.
+
+    メイン環境の新しい kernels / huggingface_hub が紛れ込むと 4.57.1 と
+    非互換なので、互換版 kernels も同じ場所に入れて遮蔽する。
+    """
+    if not os.path.isdir(os.path.join(VENDOR_DIR, "transformers")):
+        if progress_cb:
+            progress_cb("LocateAnything 用に transformers 4.57.1 を準備中...")
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install",
+            "--target", VENDOR_DIR,
+            "transformers==4.57.1", "huggingface_hub<1.0",
+        ])
+    if not os.path.isdir(os.path.join(VENDOR_DIR, "kernels")):
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install",
+            "--target", VENDOR_DIR, "--no-deps", "--upgrade",
+            "kernels==0.10.3",
+        ])
 
 
 class LocateAnythingDetector:
@@ -59,6 +68,17 @@ class LocateAnythingDetector:
 
     def __init__(self):
         self._proc: Optional[subprocess.Popen] = None
+        self._log_path: Optional[str] = None
+        self._log_file = None
+
+    def _read_log_tail(self, n: int = 15) -> str:
+        """ワーカーログの末尾を返す (エラー表示用)."""
+        try:
+            with open(self._log_path, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            return "".join(lines[-n:]).strip()
+        except Exception:
+            return "(ログを読み取れませんでした)"
 
     @property
     def _loaded(self) -> bool:
@@ -73,10 +93,13 @@ class LocateAnythingDetector:
                         "初回は ~8GB のダウンロードが発生します")
         env = os.environ.copy()
         env["PYTHONPATH"] = VENDOR_DIR + os.pathsep + env.get("PYTHONPATH", "")
+        self._log_path = os.path.join(
+            tempfile.gettempdir(), "mosaic_la_worker.log")
+        self._log_file = open(self._log_path, "w", encoding="utf-8")
         self._proc = subprocess.Popen(
             [sys.executable, WORKER_PATH],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=self._log_file,
             text=True, encoding="utf-8", env=env,
         )
         # ready 通知を待つ
@@ -85,7 +108,8 @@ class LocateAnythingDetector:
             rc = self._proc.poll()
             self._proc = None
             raise RuntimeError(
-                f"LocateAnything ワーカーの起動に失敗しました (exit={rc})")
+                f"LocateAnything ワーカーの起動に失敗しました (exit={rc})\n"
+                f"{self._read_log_tail()}")
         msg = json.loads(line)
         if not msg.get("ready"):
             self.unload()
@@ -99,7 +123,9 @@ class LocateAnythingDetector:
         if not line:
             rc = self._proc.poll()
             self._proc = None
-            raise RuntimeError(f"LocateAnything ワーカーが終了しました (exit={rc})")
+            raise RuntimeError(
+                f"LocateAnything ワーカーが終了しました (exit={rc})\n"
+                f"{self._read_log_tail()}")
         return json.loads(line)
 
     def detect(
@@ -179,6 +205,12 @@ class LocateAnythingDetector:
             except Exception:
                 self._proc.kill()
             self._proc = None
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except Exception:
+                pass
+            self._log_file = None
 
     def __del__(self):
         try:

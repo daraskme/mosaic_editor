@@ -53,8 +53,9 @@ class DetectConfigDialog:
         win = tk.Toplevel(self.parent)
         title = "自動モザイク (フォルダ一括)" if self.folder_mode else "自動検出"
         win.title(title)
-        win.geometry("520x640")
-        win.resizable(False, True)
+        win.geometry("640x680")
+        win.minsize(560, 480)
+        win.resizable(True, True)
         safe_grab(win)
 
         if self.folder_mode:
@@ -80,7 +81,8 @@ class DetectConfigDialog:
                 text = cat.label
                 if cat.note:
                     text += f"  ({cat.note})"
-                tk.Checkbutton(cls_inner, text=text, variable=var, anchor="w"
+                tk.Checkbutton(cls_inner, text=text, variable=var, anchor="w",
+                               wraplength=560, justify="left"
                                ).grid(row=i, column=0, sticky="w", padx=4)
 
         _rebuild_cls()
@@ -113,7 +115,8 @@ class DetectConfigDialog:
         backend_var = tk.StringVar(value=self.backend)
         for key, label in BACKENDS.items():
             tk.Radiobutton(eng_frame, text=label, variable=backend_var,
-                           value=key, anchor="w").pack(fill="x", padx=6)
+                           value=key, anchor="w", wraplength=560,
+                           justify="left").pack(fill="x", padx=6)
 
         # ---- 詳細設定 ----
         opt_frame = tk.LabelFrame(win, text="詳細設定")
@@ -152,8 +155,9 @@ class DetectConfigDialog:
             tk.Radiobutton(vid_frame, text="現在のフレームのみ",
                            variable=process_all_var, value=False).pack(anchor="w", padx=6)
             tk.Radiobutton(vid_frame,
-                           text="動画全体 (SAM3 トラッキング — 一度検出した対象を全フレーム追跡)",
-                           variable=process_all_var, value=True).pack(anchor="w", padx=6)
+                           text="動画全体 (一度検出した対象を全フレーム追跡)",
+                           variable=process_all_var, value=True, wraplength=560,
+                           justify="left").pack(anchor="w", padx=6)
 
         # ---- フォルダ ----
         overwrite_var = tk.BooleanVar(value=False)
@@ -163,10 +167,10 @@ class DetectConfigDialog:
 
         tk.Label(win,
                  text=("初回はモデルのダウンロードが発生します "
-                       "(SAM3: ~3.4GB / LocateAnything-3B: ~8GB)。\n"
-                       "SAM3 (facebook/sam3) は Hugging Face で利用許諾の同意が必要です。\n"
+                       "(LocateAnything-3B: ~8GB / SAM2: ~900MB / SAM3: ~3.4GB)。\n"
+                       "SAM3 (facebook/sam3) のみ Hugging Face で利用許諾の同意が必要です。\n"
                        "LocateAnything-3B は非商用研究目的のみ利用可。"),
-                 font=("", 8), fg="#888888", justify="left", wraplength=490
+                 font=("", 8), fg="#888888", justify="left", wraplength=600
                  ).pack(pady=(8, 0), padx=10, anchor="w")
 
         btn_frm = tk.Frame(win)
