@@ -50,9 +50,13 @@ def mask_to_bbox(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
 
 
 def dedup_detections(detections: List[Detection], iou_thresh: float = 0.65) -> List[Detection]:
-    """同一カテゴリ内で bbox IoU が高い重複を除去 (スコア高優先)."""
+    """同一カテゴリ内で bbox IoU が高い重複を除去.
+
+    輪郭マスク付きの検出をボックスのみの検出より優先し、
+    同条件ではスコアの高い方を残す。
+    """
     result: List[Detection] = []
-    for d in sorted(detections, key=lambda x: -x.score):
+    for d in sorted(detections, key=lambda x: (x.mask is None, -x.score)):
         dup = False
         for kept in result:
             if kept.category_key == d.category_key and _iou(kept.bbox, d.bbox) > iou_thresh:

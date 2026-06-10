@@ -18,9 +18,15 @@ from .base import Detection, ProgressCB, pick_device, pick_dtype
 
 
 class Sam3ConceptSegmenter:
-    """Sam3Model による text → instance masks."""
+    """Sam3Model による text → instance masks.
+
+    facebook/sam3 (gated) にアクセスできない場合は、コミュニティ版の
+    SAM3 Lite Text (テキストエンコーダのみ軽量化した互換チェックポイント)
+    に自動フォールバックする。
+    """
 
     MODEL_ID = "facebook/sam3"
+    FALLBACK_MODEL_ID = "yonigozlan/sam3-litetext-s0"
 
     def __init__(self):
         self._loaded = False
@@ -28,22 +34,42 @@ class Sam3ConceptSegmenter:
         self.dtype = None
         self.model = None
         self.processor = None
+        self.active_model_id: Optional[str] = None
+
+    def _official_accessible(self) -> bool:
+        from huggingface_hub import hf_hub_download
+        try:
+            hf_hub_download(self.MODEL_ID, "config.json")
+            return True
+        except Exception:
+            return False
 
     def load(self, progress_cb: ProgressCB = None):
         if self._loaded:
             return
-        import torch
-        from transformers import Sam3Model, Sam3Processor
+        from transformers import Sam3LiteTextModel, Sam3Model, Sam3Processor
 
         self.device = pick_device()
         self.dtype = pick_dtype(self.device)
+
+        if self._official_accessible():
+            self.active_model_id = self.MODEL_ID
+            model_cls = Sam3Model
+        else:
+            self.active_model_id = self.FALLBACK_MODEL_ID
+            model_cls = Sam3LiteTextModel
+            if progress_cb:
+                progress_cb("facebook/sam3 (gated) にアクセスできないため\n"
+                            "SAM3 Lite Text にフォールバックします")
+
         if progress_cb:
-            progress_cb(f"SAM3 をロード中 (device={self.device})...\n"
-                        "初回は ~3.4GB のダウンロードが発生します")
-        self.model = Sam3Model.from_pretrained(
-            self.MODEL_ID, torch_dtype=self.dtype,
+            progress_cb(f"SAM3 をロード中 ({self.active_model_id}, "
+                        f"device={self.device})...\n"
+                        "初回はモデルのダウンロードが発生します")
+        self.model = model_cls.from_pretrained(
+            self.active_model_id, torch_dtype=self.dtype,
         ).to(self.device).eval()
-        self.processor = Sam3Processor.from_pretrained(self.MODEL_ID)
+        self.processor = Sam3Processor.from_pretrained(self.active_model_id)
         self._loaded = True
 
     def detect(
