@@ -1,7 +1,7 @@
 # Mosaic Editor
 
 Python と Tkinter で作られた画像/動画モザイク編集ツールです。
-手動ブラシ編集に加え、**SAM3 (Meta)** と **LocateAnything-3B (NVIDIA)** による自動検出モザイクに対応しています。
+手動ブラシ編集に加え、**AnimeCensor (deepghs) + SAM2 (Meta)** による自動検出モザイクに対応しています。
 
 ## 主な機能
 
@@ -12,8 +12,8 @@ Python と Tkinter で作られた画像/動画モザイク編集ツールです
 - **ズーム/パン** : Ctrl+ホイールズーム（カーソル中心）、中ボタンドラッグでパン
 - **D&D対応** : 画像/動画/フォルダをウィンドウにドラッグ＆ドロップして読み込み
 - **一括処理** : フォルダを開いて `←` / `→` で順送り、保存は `_mc` フォルダに自動出力（JPEG）
-- **自動検出 (画像)** : SAM3 のテキストプロンプトで検出 → 輪郭マスクを直接取得
-- **自動検出 (動画)** : SAM3 Video が対象を**全フレームにわたり追跡**してマスク生成
+- **自動検出 (画像)** : イラスト特化の YOLOv8 で検出 → SAM2 で輪郭マスク化
+- **自動検出 (動画)** : 検出した対象を SAM2 Video が**全フレームにわたり追跡**
 - **音声保持** : 動画書き出し時に ffmpeg があれば元動画の音声を自動結合
 
 ## 自動検出
@@ -23,69 +23,40 @@ Python と Tkinter で作られた画像/動画モザイク編集ツールです
 | モデル | 役割 | サイズ | ライセンス |
 |-------|------|--------|----------|
 | [`deepghs/anime_censor_detection`](https://huggingface.co/deepghs/anime_censor_detection) | イラスト/アニメ絵の検出 (YOLOv8, ONNX) | ~50MB | Apache 2.0 |
-| [`nvidia/LocateAnything-3B`](https://huggingface.co/nvidia/LocateAnything-3B) | 実写・条件付き概念の検出 (画像+テキスト→bbox) | ~8GB | **非商用研究目的のみ** |
 | [`facebook/sam2.1-hiera-large`](https://huggingface.co/facebook/sam2.1-hiera-large) | bbox→輪郭マスク化・動画追跡 | ~900MB | Apache 2.0 |
-| [`facebook/sam3`](https://huggingface.co/facebook/sam3) (任意) | テキスト→検出+輪郭マスク (画像/動画追跡) | ~3.4GB | SAM License (商用可) |
 
 初回実行時にモデルが Hugging Face Hub からダウンロードされ、`~/.cache/huggingface/` にキャッシュされます。
+**HF アカウントやログインは不要**です。
 
-> `facebook/sam3` だけは gated モデルです (既定エンジンでは不要)。SAM3 系エンジンを使う場合のみ
-> 1. https://huggingface.co/facebook/sam3 を開いて利用規約に同意 (Meta の承認待ちあり)
-> 2. `hf auth login` (または `huggingface-cli login`) でログイン
-> しておいてください。承認されるまでは SAM3 Lite Text (コミュニティ版) に自動フォールバックします。
-
-### 検出エンジン
-
-| エンジン | 構成 | 特徴 |
-|---------|------|------|
-| **AnimeCensor + SAM2** (推奨・既定) | booru学習のYOLOv8 で bbox → SAM2.1 で輪郭化 | **イラスト/アニメ絵に最強**。1枚数十msと高速。検出は男性器/女性器/乳首のみ |
-| **LocateAnything + SAM2** | VLM で bbox → SAM2.1 で輪郭化 | 実写向け。「挿入されたアナル」のような**条件付き・文章的概念**に強い |
-| **SAM3 のみ** | テキスト→マスク直接 | 1モデルで検出+輪郭。スコア付き。要HF同意 |
-| **LocateAnything + SAM3** | VLM で bbox → SAM3 Tracker で輪郭化 | 要HF同意 |
-| **併用 (ensemble)** | AnimeCensor + LA + SAM3 を統合 | 取りこぼし最小。最も遅い |
-
-> AnimeCensor は結合部・アナルを個別クラスとして検出できません。
-> それらが必要なイラストでは「併用」か LocateAnything 系を選んでください。
+検出は booru 系大規模アノテーションで学習されたアニメ絵専用 YOLOv8 で、
+1枚あたり数十ms と高速。デフォルメされた描写にも強いのが特徴です。
 
 ### 検出カテゴリ
 
-デフォルトの検出対象（ダイアログで変更可能）:
-
 | カテゴリ | デフォルト | 備考 |
 |---------|-----------|------|
-| 男性器 | ✅ | |
+| 男性器 | ✅ | 挿入中の露出部分も検出されます |
 | 女性器 | ✅ | |
-| 睾丸 | ✅ | |
-| 結合部 (挿入) | ✅ | 挿入中の性器結合部 |
-| アナル (挿入時のみ) | ✅ | **挿入されている場合のみ**検出・モザイク |
-| アナル (常時) | ❌ | |
 | 乳首 | ❌ | モザイク不要のためデフォルトOFF |
-
-「追加クラス」に英語の名詞句を入力すれば任意の対象も検出できます。
 
 ### 動画の自動モザイク
 
-動画を開いて「自動検出」→「動画全体」を選ぶと、対象を**全フレームにわたって追跡**します。
-
-- **LocateAnything + SAM2** (既定): 150フレームごとに LocateAnything が検出し、
-  SAM2.1 Video が各対象をチャンク内全フレームに伝播。途中から映る対象も拾えます
-- **SAM3 系**: SAM3 Video がテキストプロンプトで検出 + 追跡
-
-旧版のフレーム毎検出と違い、時間方向に一貫したマスクが高速に得られます。
+動画を開いて「自動検出」→「動画全体」を選ぶと、150フレームごとのキーフレームで
+検出し、SAM2.1 Video が各対象をチャンク内全フレームに伝播・追跡します。
+途中から映り込む対象もチャンク境界の再検出で拾えます。
 
 ### 詳細設定
 
-- **検出しきい値** : 低いほど拾いやすい（誤検出も増える）。既定 0.4
+- **検出しきい値** : 低いほど拾いやすい（誤検出も増える）。既定 0.3。
+  拾い漏れがある場合は 0.15〜0.25 に下げる
 - **マスク拡張** : 検出輪郭の外側に余裕を持たせる px 数。既定 4px
-- **LocateAnything 検出強度** : fast / hybrid (推奨) / slow
 
 ## ハードウェア要件
 
-| 環境 | 推奨 |
+| 環境 | 目安 |
 |------|------|
-| NVIDIA GPU (VRAM 8GB+) | SAM3 のみ → 快適 |
-| NVIDIA GPU (VRAM 16GB+) | 全エンジン快適 |
-| CPU only | 動作はするが 1枚あたり数十秒〜 |
+| NVIDIA GPU (VRAM 4GB+) | 快適 (検出は CPU でも数十ms) |
+| CPU only | 検出は高速。SAM2 の輪郭化・動画追跡は遅め |
 
 ## インストールと実行
 
@@ -113,7 +84,7 @@ pip install -r requirements.txt
 python mosaic.py
 ```
 
-- Python 3.10+（SAM3 利用時は transformers>=5.0 が必要）
+- Python 3.10+
 - 動画の音声保持には `ffmpeg` がパスにあること（無ければ無音で保存）
 
 ## 操作まとめ
@@ -134,9 +105,6 @@ python mosaic.py
 
 ## 技術メモ
 
-- LocateAnything-3B の remote code は transformers 4.57.1 専用で、SAM3 が必要とする
-  v5 系とは同一プロセスで共存できません。そのため transformers 4.57.1 を
-  `vendor/transformers_la/` に隔離インストールし (初回利用時に自動)、
-  推論は常駐サブプロセス `la_worker.py` で実行しています
 - 検出はバックエンド非依存の `Detection` 型に正規化され、
   `DetectionPipeline.combine_masks()` で1枚のマスクに統合されます
+- SAM2 Video は bf16 だと長尺伝播で数値的に不安定なため fp32 固定です

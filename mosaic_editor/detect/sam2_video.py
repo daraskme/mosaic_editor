@@ -1,8 +1,6 @@
 """検出器 + SAM2.1 Video による動画トラッキング.
 
-SAM3 を使わない動画自動モザイクの本命パス:
-
-1. チャンク先頭フレームで検出器 (AnimeCensor / LocateAnything) が対象を検出
+1. チャンク先頭フレームで検出器 (AnimeCensor) が対象を検出
 2. SAM2.1 Video が各 bbox をオブジェクトとして全フレームに伝播 (追跡)
 3. チャンク境界ごとに再検出するので、途中から映り込む対象も拾える
 
@@ -16,7 +14,7 @@ import numpy as np
 from PIL import Image
 
 from ..core.categories import Category
-from .base import Detection, ProgressCB, pick_device, pick_dtype
+from .base import Detection, ProgressCB, pick_device
 
 # 1チャンクのフレーム数。境界ごとに検出器で再検出する。
 CHUNK_FRAMES = 150
@@ -25,7 +23,7 @@ CHUNK_FRAMES = 150
 DetectFn = Callable[[Image.Image, List[Category]], List[Detection]]
 
 
-class LaSam2VideoTracker:
+class Sam2VideoTracker:
     """キーフレーム検出 + SAM2 Video 伝播."""
 
     SAM2_MODEL_ID = "facebook/sam2.1-hiera-large"

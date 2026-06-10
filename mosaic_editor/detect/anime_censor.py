@@ -4,8 +4,6 @@ booru 系の大規模アノテーションで学習された YOLOv8 検出器。
 アニメ絵特有のデフォルメ描写・結合部に強く、ONNX 実行で1枚数十ms と高速。
 
 ラベル: nipple_f (女性乳首) / penis (男性器) / pussy (女性器)
-→ 結合部・アナル等のカテゴリはこのモデルでは検出できないため、
-  必要な場合は LocateAnything 系エンジンか ensemble を使う。
 """
 from __future__ import annotations
 

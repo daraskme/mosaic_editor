@@ -1,7 +1,7 @@
 """メインエディタウィンドウ.
 
 旧版 (mosaic.py) の編集機能を引き継ぎつつ、自動検出を
-SAM3 / LocateAnything-3B の新パイプラインに置き換えたもの。
+AnimeCensor + SAM2 のパイプラインに置き換えたもの。
 """
 from __future__ import annotations
 
@@ -80,9 +80,7 @@ class MosaicEditor:
         self._detect_categories: List[Category] = list(DEFAULT_CATEGORIES)
         self._detect_enabled: Dict[str, bool] = {
             c.key: c.enabled_default for c in DEFAULT_CATEGORIES}
-        self._detect_backend: str = "anime_sam2"
         self._detect_threshold: float = 0.3
-        self._detect_gen_mode: str = "hybrid"
         self._detect_margin: int = 4
         self._detect_cancel: bool = False
 
@@ -165,7 +163,7 @@ class MosaicEditor:
         menubar.add_cascade(label="ファイル", menu=filemenu)
 
         detectmenu = tk.Menu(menubar, tearoff=0)
-        detectmenu.add_command(label="自動検出 (SAM3 / LocateAnything)",
+        detectmenu.add_command(label="自動検出 (AnimeCensor + SAM2)",
                                command=self.auto_detect_open_dialog)
         menubar.add_cascade(label="自動検出", menu=detectmenu)
         self.root.config(menu=menubar)
@@ -886,18 +884,12 @@ class MosaicEditor:
             self.root,
             all_categories=self._detect_categories,
             enabled_keys=self._detect_enabled,
-            backend=self._detect_backend,
             threshold=self._detect_threshold,
-            generation_mode=self._detect_gen_mode,
             margin_px=self._detect_margin,
             **kwargs)
         cfg = dlg.show()
         if cfg is not None:
-            # ダイアログで増えた追加クラスと設定を保持
-            self._detect_categories = dlg.all_categories
-            self._detect_backend = cfg.backend
             self._detect_threshold = cfg.threshold
-            self._detect_gen_mode = cfg.generation_mode
             self._detect_margin = cfg.margin_px
         return cfg
 
@@ -933,8 +925,7 @@ class MosaicEditor:
             try:
                 detections = self.pipeline.detect(
                     current_img, cfg.categories,
-                    backend=cfg.backend, threshold=cfg.threshold,
-                    generation_mode=cfg.generation_mode, progress_cb=progress)
+                    threshold=cfg.threshold, progress_cb=progress)
                 self.root.after(0, lambda: self._review_detections(win, cfg, detections))
             except Exception as e:
                 err = str(e)
@@ -953,9 +944,7 @@ class MosaicEditor:
             messagebox.showinfo(
                 "自動検出",
                 "検出結果がありませんでした。\n"
-                "・しきい値を下げる\n"
-                "・検出エンジンを「LocateAnything + SAM3」や「両方併用」に変える\n"
-                "等を試してください。")
+                "検出しきい値を下げて (例: 0.15) 再試行してください。")
             return
 
         accepted = show_detection_results(self.root, detections)
@@ -978,14 +967,9 @@ class MosaicEditor:
             win.destroy()
         except Exception:
             pass
-        hint = ""
-        if "gated" in err or "403" in err:
-            hint = ("\n\nfacebook/sam3 へのアクセス許可が必要です:\n"
-                    "1. https://huggingface.co/facebook/sam3 で利用規約に同意\n"
-                    "2. `hf auth login` でログイン")
-        messagebox.showerror("検出エラー", f"検出中にエラーが発生しました:\n{err}{hint}")
+        messagebox.showerror("検出エラー", f"検出中にエラーが発生しました:\n{err}")
 
-    # ---- 動画全体: SAM3 トラッキング ----
+    # ---- 動画全体: SAM2 トラッキング ----
 
     def _run_video_tracking(self, cfg: DetectConfig):
         if self.session.current is None:
@@ -993,7 +977,7 @@ class MosaicEditor:
         video_path = self.session.current
         win, status, _ = show_progress_window(
             self.root, "動画トラッキング中",
-            "SAM3 Video で検出 + トラッキングしています...",
+            "検出 + トラッキングしています...",
             cancelable=True,
             on_cancel=lambda: setattr(self, "_detect_cancel", True))
         self._detect_cancel = False
@@ -1005,9 +989,7 @@ class MosaicEditor:
             try:
                 masks = self.pipeline.track_video(
                     video_path, cfg.categories,
-                    backend=cfg.backend,
                     threshold=cfg.threshold,
-                    generation_mode=cfg.generation_mode,
                     progress_cb=progress,
                     cancel_check=lambda: self._detect_cancel)
                 if cfg.margin_px > 0:
@@ -1085,9 +1067,7 @@ class MosaicEditor:
                         self.root.after(0, lambda v=fi + 1: set_bar(v))
                         continue
                     detections = self.pipeline.detect(
-                        img_pil, cfg.categories,
-                        backend=cfg.backend, threshold=cfg.threshold,
-                        generation_mode=cfg.generation_mode)
+                        img_pil, cfg.categories, threshold=cfg.threshold)
                     if detections:
                         w, h = img_pil.size
                         combined = DetectionPipeline.combine_masks(

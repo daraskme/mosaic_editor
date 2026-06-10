@@ -59,7 +59,7 @@ def show_progress_window(root, title: str, msg: str,
     return win, status_label, bar
 
 
-REQUIRED_PACKAGES = ("torch", "transformers", "accelerate")
+REQUIRED_PACKAGES = ("torch", "transformers", "imgutils")
 
 
 def check_missing_packages(packages=REQUIRED_PACKAGES) -> List[str]:

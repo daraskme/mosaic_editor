@@ -1,6 +1,6 @@
 """SAM2.1 (Meta) による bbox → 輪郭マスクの再セグメント.
 
-LocateAnything-3B が返した bbox を「箱の中のその物体」の輪郭マスクにする。
+検出器が返した bbox を「箱の中のその物体」の輪郭マスクにする。
 facebook/sam2.1-hiera-* は非gated・Apache-2.0 で、HF ログイン不要。
 """
 from __future__ import annotations

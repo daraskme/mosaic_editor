@@ -4,23 +4,12 @@ numpy
 opencv-python
 tkinterdnd2
 
-# 自動検出 (SAM3 / LocateAnything-3B)
+# 自動検出 (AnimeCensor + SAM2)
 # GPU 環境では torch を CUDA ビルドで入れること:
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 torch
 torchvision
 transformers>=5.0.0
-accelerate
-
-# LocateAnything-3B の remote code が要求する依存
-peft
-decord
-lmdb
-requests
-
-# SAM3 の NMS/穴埋め後処理 (任意・推奨)
-# 0.14+ は transformers 5.10 の hub_kernels と非互換のため固定
-kernels==0.13.0
 
 # イラスト/アニメ絵向け検出 (deepghs/anime_censor_detection)
 dghs-imgutils

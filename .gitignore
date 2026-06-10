@@ -47,5 +47,3 @@ civitai/
 *.pt
 *.safetensors
 
-# LocateAnything 用の隔離 transformers (自動生成)
-vendor/
