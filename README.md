@@ -22,23 +22,25 @@ Python と Tkinter で作られた画像/動画モザイク編集ツールです
 
 | モデル | 役割 | サイズ | ライセンス |
 |-------|------|--------|----------|
-| [`facebook/sam3`](https://huggingface.co/facebook/sam3) | テキスト→検出+輪郭マスク (画像/動画追跡) | ~3.4GB | SAM License (商用可) |
 | [`nvidia/LocateAnything-3B`](https://huggingface.co/nvidia/LocateAnything-3B) | 検出 (画像+テキスト→bbox)。条件付き概念に強い | ~8GB | **非商用研究目的のみ** |
+| [`facebook/sam2.1-hiera-large`](https://huggingface.co/facebook/sam2.1-hiera-large) | bbox→輪郭マスク化・動画追跡 | ~900MB | Apache 2.0 |
+| [`facebook/sam3`](https://huggingface.co/facebook/sam3) (任意) | テキスト→検出+輪郭マスク (画像/動画追跡) | ~3.4GB | SAM License (商用可) |
 
 初回実行時にモデルが Hugging Face Hub からダウンロードされ、`~/.cache/huggingface/` にキャッシュされます。
 
-> **重要**: `facebook/sam3` は gated モデルです。初回利用前に
-> 1. https://huggingface.co/facebook/sam3 を開いて利用規約に同意
+> `facebook/sam3` だけは gated モデルです (既定エンジンでは不要)。SAM3 系エンジンを使う場合のみ
+> 1. https://huggingface.co/facebook/sam3 を開いて利用規約に同意 (Meta の承認待ちあり)
 > 2. `hf auth login` (または `huggingface-cli login`) でログイン
-> しておいてください。
+> しておいてください。承認されるまでは SAM3 Lite Text (コミュニティ版) に自動フォールバックします。
 
 ### 検出エンジン
 
 | エンジン | 構成 | 特徴 |
 |---------|------|------|
-| **SAM3 のみ** (推奨) | テキスト→マスク直接 | 高速。1モデルで検出+輪郭。スコア付き |
-| **LocateAnything + SAM3** | VLM で bbox → SAM3 Tracker で輪郭化 | 「挿入されたアナル」のような**条件付き・文章的概念**に強い |
-| **両方併用** | 上記2つを実行して統合 | 取りこぼし最小。最も遅い |
+| **LocateAnything + SAM2** (推奨・既定) | VLM で bbox → SAM2.1 で輪郭化 | HF同意不要。「挿入されたアナル」のような**条件付き・文章的概念**に強い |
+| **SAM3 のみ** | テキスト→マスク直接 | 1モデルで検出+輪郭。スコア付き。要HF同意 |
+| **LocateAnything + SAM3** | VLM で bbox → SAM3 Tracker で輪郭化 | 要HF同意 |
+| **併用 (ensemble)** | LA+SAM2 と SAM3 を統合 | 取りこぼし最小。最も遅い |
 
 ### 検出カテゴリ
 
@@ -58,9 +60,13 @@ Python と Tkinter で作られた画像/動画モザイク編集ツールです
 
 ### 動画の自動モザイク
 
-動画を開いて「自動検出」→「動画全体」を選ぶと、SAM3 Video が対象を検出して
-**全フレームにわたって追跡**します。旧版のフレーム毎検出と違い、
-時間方向に一貫したマスクが高速に得られます。
+動画を開いて「自動検出」→「動画全体」を選ぶと、対象を**全フレームにわたって追跡**します。
+
+- **LocateAnything + SAM2** (既定): 150フレームごとに LocateAnything が検出し、
+  SAM2.1 Video が各対象をチャンク内全フレームに伝播。途中から映る対象も拾えます
+- **SAM3 系**: SAM3 Video がテキストプロンプトで検出 + 追跡
+
+旧版のフレーム毎検出と違い、時間方向に一貫したマスクが高速に得られます。
 
 ### 詳細設定
 

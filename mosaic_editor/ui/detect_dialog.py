@@ -15,7 +15,7 @@ class DetectConfig:
 
     def __init__(self):
         self.categories: List[Category] = []
-        self.backend: str = "sam3"
+        self.backend: str = "la_sam2"
         self.threshold: float = 0.4
         self.generation_mode: str = "hybrid"
         self.margin_px: int = 4
@@ -29,7 +29,7 @@ class DetectConfigDialog:
     def __init__(self, parent,
                  all_categories: List[Category],
                  enabled_keys: Dict[str, bool],
-                 backend: str = "sam3",
+                 backend: str = "la_sam2",
                  threshold: float = 0.4,
                  generation_mode: str = "hybrid",
                  margin_px: int = 4,

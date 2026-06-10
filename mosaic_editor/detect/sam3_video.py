@@ -26,6 +26,7 @@ class Sam3VideoTracker:
     def __init__(self):
         self._loaded = False
         self.device: Optional[str] = None
+        self.dtype = None
         self.model = None
         self.processor = None
 
@@ -34,10 +35,13 @@ class Sam3VideoTracker:
             return
         from transformers import Sam3VideoModel, Sam3VideoProcessor
 
+        from .base import pick_dtype
         self.device = pick_device()
+        self.dtype = pick_dtype(self.device)
         if progress_cb:
             progress_cb(f"SAM3 Video をロード中 (device={self.device})...")
-        self.model = Sam3VideoModel.from_pretrained(self.MODEL_ID)
+        self.model = Sam3VideoModel.from_pretrained(
+            self.MODEL_ID, torch_dtype=self.dtype)
         self.model = self.model.to(self.device).eval()
         self.processor = Sam3VideoProcessor.from_pretrained(self.MODEL_ID)
         self._loaded = True
@@ -94,7 +98,7 @@ class Sam3VideoTracker:
                 inference_device=self.device,
                 processing_device="cpu",
                 video_storage_device="cpu",
-                dtype=torch.bfloat16 if self.device == "cuda" else torch.float32,
+                dtype=self.dtype,
             )
             self.processor.add_text_prompt(inference_session=session, text=prompts)
 

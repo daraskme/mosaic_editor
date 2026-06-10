@@ -17,3 +17,6 @@ peft
 decord
 lmdb
 requests
+
+# SAM3 の NMS/穴埋め後処理 (任意・推奨)
+kernels
