@@ -23,7 +23,7 @@ from ..core.session import (ALL_SUPPORTED_EXT, SUPPORTED_EXT,
                             SUPPORTED_VIDEO_EXT, Session)
 from ..detect.pipeline import DetectionPipeline
 from .detect_dialog import DetectConfig, DetectConfigDialog, show_detection_results
-from .progress import ensure_deps, show_progress_window
+from .progress import ensure_deps, safe_grab, show_progress_window
 
 
 class MosaicEditor:
@@ -339,7 +339,7 @@ class MosaicEditor:
         dlg.title("ズーム率を指定")
         dlg.geometry("260x100")
         dlg.resizable(False, False)
-        dlg.grab_set()
+        safe_grab(dlg)
         tk.Label(dlg, text="ズーム率 (%)を入力 (10〜2000)", font=("", 9)).pack(pady=(10, 4))
         val = tk.IntVar(value=int(self.zoom * 100))
         sb = tk.Spinbox(dlg, from_=10, to=2000, width=8, textvariable=val, font=("", 10))

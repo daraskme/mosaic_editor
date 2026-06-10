@@ -10,6 +10,22 @@ from tkinter import messagebox, ttk
 from typing import Callable, List, Optional, Tuple
 
 
+def safe_grab(win: tk.Toplevel) -> None:
+    """ウィンドウが表示されてから grab_set する (未表示だと TclError になる)."""
+    def _try(attempts: int = 20):
+        try:
+            win.grab_set()
+        except tk.TclError:
+            if attempts > 0 and win.winfo_exists():
+                win.after(50, lambda: _try(attempts - 1))
+
+    try:
+        win.update_idletasks()
+    except tk.TclError:
+        return
+    _try()
+
+
 def show_progress_window(root, title: str, msg: str,
                          with_progress_bar: bool = False,
                          maximum: int = 100,
@@ -21,7 +37,7 @@ def show_progress_window(root, title: str, msg: str,
     win.title(title)
     win.geometry("440x170")
     win.resizable(False, False)
-    win.grab_set()
+    safe_grab(win)
 
     status_label = tk.Label(win, text=msg, pady=8, wraplength=420,
                             justify="left", font=("", 9))
@@ -78,7 +94,7 @@ def install_packages_then(root, packages: List[str], on_ready: Callable) -> None
     win = tk.Toplevel(root)
     win.title("依存パッケージをインストール中")
     win.geometry("560x320")
-    win.grab_set()
+    safe_grab(win)
 
     tk.Label(win, text=f"インストール中: {', '.join(packages)}",
              font=("", 10, "bold"), pady=6).pack()

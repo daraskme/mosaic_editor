@@ -8,6 +8,7 @@ from typing import Dict, List, Optional
 from ..core.categories import Category, make_custom_category
 from ..detect.base import Detection
 from ..detect.pipeline import BACKENDS
+from .progress import safe_grab
 
 
 class DetectConfig:
@@ -54,7 +55,7 @@ class DetectConfigDialog:
         win.title(title)
         win.geometry("520x640")
         win.resizable(False, True)
-        win.grab_set()
+        safe_grab(win)
 
         if self.folder_mode:
             tk.Label(win,
@@ -208,7 +209,7 @@ def show_detection_results(parent, detections: List[Detection]) -> Optional[List
     dlg = tk.Toplevel(parent)
     dlg.title(f"検出結果 ({len(detections)}件)")
     dlg.geometry("560x420")
-    dlg.grab_set()
+    safe_grab(dlg)
 
     tk.Label(dlg, text="チェックした項目をモザイク範囲に追加します",
              font=("", 9), fg="gray").pack(pady=(6, 2))
