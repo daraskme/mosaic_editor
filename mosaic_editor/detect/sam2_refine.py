@@ -26,6 +26,7 @@ class Sam2BoxRefiner:
     def load(self, progress_cb: ProgressCB = None):
         if self._loaded:
             return
+        import transformers
         from transformers import Sam2Model, Sam2Processor
 
         self.device = pick_device()
@@ -33,9 +34,16 @@ class Sam2BoxRefiner:
         if progress_cb:
             progress_cb(f"SAM2.1 をロード中 (device={self.device})...\n"
                         "初回は ~900MB のダウンロードが発生します")
-        self.model = Sam2Model.from_pretrained(
-            self.MODEL_ID, torch_dtype=self.dtype,
-        ).to(self.device).eval()
+        # sam2.1 チェックポイントは model_type=sam2_video のため、Sam2Model への
+        # ロードで無害な警告が出る。ロードの間だけ抑制する
+        prev = transformers.logging.get_verbosity()
+        transformers.logging.set_verbosity_error()
+        try:
+            self.model = Sam2Model.from_pretrained(
+                self.MODEL_ID, torch_dtype=self.dtype,
+            ).to(self.device).eval()
+        finally:
+            transformers.logging.set_verbosity(prev)
         self.processor = Sam2Processor.from_pretrained(self.MODEL_ID)
         self._loaded = True
 

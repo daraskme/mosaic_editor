@@ -12,4 +12,7 @@ torchvision
 transformers>=5.0.0
 
 # イラスト/アニメ絵向け検出 (deepghs/anime_censor_detection)
+# onnxruntime は CPU 版を明示 (GPU 版は CUDA 12 前提で torch cu13 と競合し、
+# 検出モデルが小さいため CPU で十分高速 ~50ms/枚)
 dghs-imgutils
+onnxruntime
