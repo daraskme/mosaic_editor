@@ -19,4 +19,8 @@ lmdb
 requests
 
 # SAM3 の NMS/穴埋め後処理 (任意・推奨)
-kernels
+# 0.14+ は transformers 5.10 の hub_kernels と非互換のため固定
+kernels==0.13.0
+
+# イラスト/アニメ絵向け検出 (deepghs/anime_censor_detection)
+dghs-imgutils

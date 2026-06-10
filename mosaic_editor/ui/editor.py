@@ -80,8 +80,8 @@ class MosaicEditor:
         self._detect_categories: List[Category] = list(DEFAULT_CATEGORIES)
         self._detect_enabled: Dict[str, bool] = {
             c.key: c.enabled_default for c in DEFAULT_CATEGORIES}
-        self._detect_backend: str = "la_sam2"
-        self._detect_threshold: float = 0.4
+        self._detect_backend: str = "anime_sam2"
+        self._detect_threshold: float = 0.3
         self._detect_gen_mode: str = "hybrid"
         self._detect_margin: int = 4
         self._detect_cancel: bool = False
@@ -1006,6 +1006,7 @@ class MosaicEditor:
                 masks = self.pipeline.track_video(
                     video_path, cfg.categories,
                     backend=cfg.backend,
+                    threshold=cfg.threshold,
                     generation_mode=cfg.generation_mode,
                     progress_cb=progress,
                     cancel_check=lambda: self._detect_cancel)

@@ -16,8 +16,8 @@ class DetectConfig:
 
     def __init__(self):
         self.categories: List[Category] = []
-        self.backend: str = "la_sam2"
-        self.threshold: float = 0.4
+        self.backend: str = "anime_sam2"
+        self.threshold: float = 0.3
         self.generation_mode: str = "hybrid"
         self.margin_px: int = 4
         self.process_all_frames: bool = False
@@ -30,8 +30,8 @@ class DetectConfigDialog:
     def __init__(self, parent,
                  all_categories: List[Category],
                  enabled_keys: Dict[str, bool],
-                 backend: str = "la_sam2",
-                 threshold: float = 0.4,
+                 backend: str = "anime_sam2",
+                 threshold: float = 0.3,
                  generation_mode: str = "hybrid",
                  margin_px: int = 4,
                  is_video_mode: bool = False,
@@ -122,12 +122,20 @@ class DetectConfigDialog:
         opt_frame = tk.LabelFrame(win, text="詳細設定")
         opt_frame.pack(fill="x", padx=10, pady=4)
 
+        row0 = tk.Frame(opt_frame)
+        row0.pack(fill="x", padx=6, pady=(2, 0))
+        tk.Label(row0,
+                 text="※ AnimeCensor が検出できるのは 男性器/女性器/乳首 のみ。"
+                      "結合部・アナルも必要な場合は LocateAnything 系か併用を選択。",
+                 font=("", 8), fg="#996600", justify="left", wraplength=580
+                 ).pack(anchor="w")
+
         row1 = tk.Frame(opt_frame)
         row1.pack(fill="x", padx=6, pady=2)
         tk.Label(row1, text="検出しきい値 (低いほど拾いやすい):",
                  font=("", 9)).pack(side="left")
         thr_var = tk.DoubleVar(value=self.threshold)
-        tk.Scale(row1, from_=0.1, to=0.9, resolution=0.05, variable=thr_var,
+        tk.Scale(row1, from_=0.05, to=0.9, resolution=0.05, variable=thr_var,
                  orient=tk.HORIZONTAL, length=160).pack(side="left", padx=6)
 
         row2 = tk.Frame(opt_frame)

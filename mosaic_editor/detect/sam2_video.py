@@ -1,8 +1,8 @@
-"""LocateAnything-3B + SAM2.1 Video による動画トラッキング.
+"""検出器 + SAM2.1 Video による動画トラッキング.
 
 SAM3 を使わない動画自動モザイクの本命パス:
 
-1. チャンク先頭フレームで LocateAnything-3B が対象を検出 (bbox)
+1. チャンク先頭フレームで検出器 (AnimeCensor / LocateAnything) が対象を検出
 2. SAM2.1 Video が各 bbox をオブジェクトとして全フレームに伝播 (追跡)
 3. チャンク境界ごとに再検出するので、途中から映り込む対象も拾える
 
@@ -16,20 +16,22 @@ import numpy as np
 from PIL import Image
 
 from ..core.categories import Category
-from .base import ProgressCB, pick_device, pick_dtype
+from .base import Detection, ProgressCB, pick_device, pick_dtype
 
-# 1チャンクのフレーム数。境界ごとに LocateAnything で再検出する。
+# 1チャンクのフレーム数。境界ごとに検出器で再検出する。
 CHUNK_FRAMES = 150
+
+# 検出関数: (キーフレーム画像, カテゴリ) -> 検出リスト
+DetectFn = Callable[[Image.Image, List[Category]], List[Detection]]
 
 
 class LaSam2VideoTracker:
-    """LocateAnything 検出 + SAM2 Video 伝播."""
+    """キーフレーム検出 + SAM2 Video 伝播."""
 
     SAM2_MODEL_ID = "facebook/sam2.1-hiera-large"
 
-    def __init__(self, locator):
-        # locator: LocateAnythingDetector (共有してモデルロードを1回に)
-        self.locator = locator
+    def __init__(self, detect_fn: DetectFn):
+        self.detect_fn = detect_fn
         self._loaded = False
         self.device: Optional[str] = None
         self.dtype = None
@@ -39,10 +41,13 @@ class LaSam2VideoTracker:
     def load(self, progress_cb: ProgressCB = None):
         if self._loaded:
             return
+        import torch
         from transformers import Sam2VideoModel, Sam2VideoProcessor
 
         self.device = pick_device()
-        self.dtype = pick_dtype(self.device)
+        # bf16 だと長尺の伝播でメモリアテンションが数値的に不安定になり
+        # 途中で対象をロストするため fp32 固定 (モデルは ~900MB と小さい)
+        self.dtype = torch.float32
         if progress_cb:
             progress_cb(f"SAM2.1 Video をロード中 (device={self.device})...")
         self.model = Sam2VideoModel.from_pretrained(
@@ -55,7 +60,6 @@ class LaSam2VideoTracker:
         self,
         video_path: str,
         categories: List[Category],
-        generation_mode: str = "hybrid",
         progress_cb: ProgressCB = None,
         cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Dict[int, np.ndarray]:
@@ -64,7 +68,6 @@ class LaSam2VideoTracker:
         import torch
 
         self.load(progress_cb=progress_cb)
-        self.locator.load(progress_cb=progress_cb)
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -90,12 +93,11 @@ class LaSam2VideoTracker:
             if not frames:
                 break
 
-            # ---- チャンク先頭フレームで LocateAnything 検出 ----
+            # ---- チャンク先頭フレームで検出 ----
             if progress_cb:
-                progress_cb(f"フレーム {frame_base + 1}: LocateAnything-3B 検出中...")
+                progress_cb(f"フレーム {frame_base + 1}: 対象を検出中...")
             first_img = Image.fromarray(frames[0])
-            detections = self.locator.detect(
-                first_img, categories, generation_mode=generation_mode)
+            detections = self.detect_fn(first_img, categories)
 
             if not detections:
                 # このチャンクに対象なし → 次のチャンクへ

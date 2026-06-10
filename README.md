@@ -22,7 +22,8 @@ Python と Tkinter で作られた画像/動画モザイク編集ツールです
 
 | モデル | 役割 | サイズ | ライセンス |
 |-------|------|--------|----------|
-| [`nvidia/LocateAnything-3B`](https://huggingface.co/nvidia/LocateAnything-3B) | 検出 (画像+テキスト→bbox)。条件付き概念に強い | ~8GB | **非商用研究目的のみ** |
+| [`deepghs/anime_censor_detection`](https://huggingface.co/deepghs/anime_censor_detection) | イラスト/アニメ絵の検出 (YOLOv8, ONNX) | ~50MB | Apache 2.0 |
+| [`nvidia/LocateAnything-3B`](https://huggingface.co/nvidia/LocateAnything-3B) | 実写・条件付き概念の検出 (画像+テキスト→bbox) | ~8GB | **非商用研究目的のみ** |
 | [`facebook/sam2.1-hiera-large`](https://huggingface.co/facebook/sam2.1-hiera-large) | bbox→輪郭マスク化・動画追跡 | ~900MB | Apache 2.0 |
 | [`facebook/sam3`](https://huggingface.co/facebook/sam3) (任意) | テキスト→検出+輪郭マスク (画像/動画追跡) | ~3.4GB | SAM License (商用可) |
 
@@ -37,10 +38,14 @@ Python と Tkinter で作られた画像/動画モザイク編集ツールです
 
 | エンジン | 構成 | 特徴 |
 |---------|------|------|
-| **LocateAnything + SAM2** (推奨・既定) | VLM で bbox → SAM2.1 で輪郭化 | HF同意不要。「挿入されたアナル」のような**条件付き・文章的概念**に強い |
+| **AnimeCensor + SAM2** (推奨・既定) | booru学習のYOLOv8 で bbox → SAM2.1 で輪郭化 | **イラスト/アニメ絵に最強**。1枚数十msと高速。検出は男性器/女性器/乳首のみ |
+| **LocateAnything + SAM2** | VLM で bbox → SAM2.1 で輪郭化 | 実写向け。「挿入されたアナル」のような**条件付き・文章的概念**に強い |
 | **SAM3 のみ** | テキスト→マスク直接 | 1モデルで検出+輪郭。スコア付き。要HF同意 |
 | **LocateAnything + SAM3** | VLM で bbox → SAM3 Tracker で輪郭化 | 要HF同意 |
-| **併用 (ensemble)** | LA+SAM2 と SAM3 を統合 | 取りこぼし最小。最も遅い |
+| **併用 (ensemble)** | AnimeCensor + LA + SAM3 を統合 | 取りこぼし最小。最も遅い |
+
+> AnimeCensor は結合部・アナルを個別クラスとして検出できません。
+> それらが必要なイラストでは「併用」か LocateAnything 系を選んでください。
 
 ### 検出カテゴリ
 

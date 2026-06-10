@@ -23,13 +23,14 @@ from ..core.masking import dilate_mask
 from .base import Detection, ProgressCB, dedup_detections
 
 BACKENDS: Dict[str, str] = {
-    "la_sam2": "LocateAnything + SAM2 (推奨・HF同意不要)",
+    "anime_sam2": "AnimeCensor + SAM2 (イラスト/アニメ絵向け・高速・推奨)",
+    "la_sam2": "LocateAnything + SAM2 (実写・結合部などの条件付き概念向け)",
     "sam3": "SAM3 のみ (テキスト→マスク直接・要HF同意)",
     "la_sam3": "LocateAnything + SAM3 (要HF同意)",
-    "ensemble": "LocateAnything+SAM2 と SAM3 を併用 (低速・取りこぼし最小)",
+    "ensemble": "AnimeCensor + LocateAnything + SAM3 を併用 (低速・取りこぼし最小)",
 }
 
-DEFAULT_BACKEND = "la_sam2"
+DEFAULT_BACKEND = "anime_sam2"
 
 
 class DetectionPipeline:
@@ -40,8 +41,9 @@ class DetectionPipeline:
         self._sam3_refiner = None
         self._sam2_refiner = None
         self._locator = None
+        self._anime = None
         self._sam3_video = None
-        self._la_sam2_video = None
+        self._sam2_video_trackers: Dict[str, object] = {}
 
     # ---- 遅延ロード ----
 
@@ -74,18 +76,39 @@ class DetectionPipeline:
         return self._locator
 
     @property
+    def anime(self):
+        if self._anime is None:
+            from .anime_censor import AnimeCensorDetector
+            self._anime = AnimeCensorDetector()
+        return self._anime
+
+    @property
     def sam3_video(self):
         if self._sam3_video is None:
             from .sam3_video import Sam3VideoTracker
             self._sam3_video = Sam3VideoTracker()
         return self._sam3_video
 
-    @property
-    def la_sam2_video(self):
-        if self._la_sam2_video is None:
+    def _sam2_video_tracker(self, backend: str, threshold: float,
+                            generation_mode: str):
+        """バックエンドに応じたキーフレーム検出器付き SAM2 トラッカーを返す.
+
+        SAM2 モデル本体は共有キャッシュし、キーフレーム検出関数は
+        呼び出しごとの設定 (threshold 等) を反映して差し替える。
+        """
+        tracker = self._sam2_video_trackers.get("shared")
+        if tracker is None:
             from .sam2_video import LaSam2VideoTracker
-            self._la_sam2_video = LaSam2VideoTracker(self.locator)
-        return self._la_sam2_video
+            tracker = LaSam2VideoTracker(lambda img, cats: [])
+            self._sam2_video_trackers["shared"] = tracker
+
+        if backend == "anime_sam2":
+            tracker.detect_fn = lambda img, cats: self.anime.detect(
+                img, cats, threshold=threshold)
+        else:
+            tracker.detect_fn = lambda img, cats: self.locator.detect(
+                img, cats, generation_mode=generation_mode)
+        return tracker
 
     # ---- 画像検出 ----
 
@@ -100,13 +123,18 @@ class DetectionPipeline:
     ) -> List[Detection]:
         detections: List[Detection] = []
 
+        boxes: List[Detection] = []
+        if backend in ("anime_sam2", "ensemble"):
+            boxes.extend(self.anime.detect(
+                image, categories, threshold=threshold, progress_cb=progress_cb))
         if backend in ("la_sam2", "la_sam3", "ensemble"):
+            boxes.extend(self.locator.detect(
+                image, categories,
+                generation_mode=generation_mode, progress_cb=progress_cb))
+
+        if boxes:
             refiner = (self.sam3_refiner if backend == "la_sam3"
                        else self.sam2_refiner)
-            boxes = self.locator.detect(
-                image, categories,
-                generation_mode=generation_mode, progress_cb=progress_cb,
-            )
             for i, det in enumerate(boxes):
                 if progress_cb:
                     progress_cb(f"輪郭マスク化 [{i + 1}/{len(boxes)}]...")
@@ -138,6 +166,7 @@ class DetectionPipeline:
         video_path: str,
         categories: List[Category],
         backend: str = DEFAULT_BACKEND,
+        threshold: float = 0.3,
         generation_mode: str = "hybrid",
         progress_cb: ProgressCB = None,
         cancel_check: Optional[Callable[[], bool]] = None,
@@ -147,8 +176,9 @@ class DetectionPipeline:
             return self.sam3_video.track_video(
                 video_path, categories,
                 progress_cb=progress_cb, cancel_check=cancel_check)
-        return self.la_sam2_video.track_video(
-            video_path, categories, generation_mode=generation_mode,
+        tracker = self._sam2_video_tracker(backend, threshold, generation_mode)
+        return tracker.track_video(
+            video_path, categories,
             progress_cb=progress_cb, cancel_check=cancel_check)
 
     @staticmethod
