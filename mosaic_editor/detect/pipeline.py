@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import logging
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -15,6 +16,8 @@ from PIL import Image
 from ..core.categories import MOSAIC_KEY, Category, split_categories
 from ..core.masking import dilate_mask
 from .base import Detection, ProgressCB, dedup_detections
+
+logger = logging.getLogger(__name__)
 
 
 class DetectionPipeline:
@@ -67,14 +70,15 @@ class DetectionPipeline:
                 progress_cb=progress_cb)
 
         if use_refiner and boxes:
-            for i, det in enumerate(boxes):
+            try:
+                masks = self.refiner.segment_boxes(
+                    image, [det.bbox for det in boxes], progress_cb=progress_cb)
+                for det, mask in zip(boxes, masks, strict=True):
+                    det.mask = mask
+            except Exception as exc:
+                logger.warning("SAM2 refinement failed: %s", exc)
                 if progress_cb:
-                    progress_cb(f"SAM2 で輪郭マスク化 [{i + 1}/{len(boxes)}]...")
-                try:
-                    det.mask = self.refiner.segment_box(image, det.bbox)
-                except Exception as e:
-                    print(f"[refine] failed for {det.bbox}: {e}")
-                    det.mask = None
+                    progress_cb(f"SAM2 輪郭化に失敗、矩形を使用: {exc}")
 
         mosaics: List[Detection] = []
         if mosaic_categories:
