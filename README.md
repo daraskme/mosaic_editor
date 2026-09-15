@@ -136,3 +136,17 @@ python mosaic.py
 ```bash
 python -m unittest discover -s tests -t .
 ```
+
+## 配布用 exe
+
+PyInstaller で単一 exe にまとめられます (`MosaicEditor.spec` 同梱)。
+
+```bash
+pip install Pillow numpy opencv-python tkinterdnd2 pyinstaller
+pyinstaller MosaicEditor.spec
+```
+
+`dist/MosaicEditor.exe` (~65MB) が生成され、Python 未導入の環境でも動作します。
+手動編集と `モザイク` 検出は使えますが、局部の自動検出用依存 (torch 等) は
+spec の `excludes` で除外されているため、フル版として配布したい場合は
+`excludes` を外してフル依存を入れた環境でビルドしてください (数GBになります)。
