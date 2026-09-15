@@ -86,6 +86,14 @@ def ensure_deps(root, on_ready: Callable, packages=REQUIRED_PACKAGES) -> None:
     if not missing:
         on_ready()
         return
+    if getattr(sys, "frozen", False):
+        messagebox.showinfo(
+            "自動検出を実行できません",
+            "この exe には自動検出の実行環境 (torch 等) が"
+            "含まれていません。\n"
+            "男性器・女性器・乳首の検出を使うには、"
+            "フル版ビルドか Python 環境での実行が必要です。")
+        return
     if not messagebox.askyesno(
         "依存パッケージのインストール",
         "自動検出には以下のパッケージが必要です:\n\n"
