@@ -1,7 +1,8 @@
 # Mosaic Editor
 
 Python と Tkinter で作られた画像/動画モザイク編集ツールです。
-手動ブラシ編集に加え、**AnimeCensor (deepghs) + SAM2 (Meta)** による自動検出モザイクに対応しています。
+手動ブラシ編集に加え、既存モザイク領域の画像処理検出と、
+**AnimeCensor (deepghs) + SAM2 (Meta)** による自動検出モザイクに対応しています。
 
 ## 主な機能
 
@@ -25,7 +26,9 @@ Python と Tkinter で作られた画像/動画モザイク編集ツールです
 | [`deepghs/anime_censor_detection`](https://huggingface.co/deepghs/anime_censor_detection) | イラスト/アニメ絵の検出 (YOLOv8, ONNX) | ~50MB | Apache 2.0 |
 | [`facebook/sam2.1-hiera-large`](https://huggingface.co/facebook/sam2.1-hiera-large) | bbox→輪郭マスク化・動画追跡 | ~900MB | Apache 2.0 |
 
-初回実行時にモデルが Hugging Face Hub からダウンロードされ、`~/.cache/huggingface/` にキャッシュされます。
+既存モザイクの検出 (`モザイク` カテゴリ) は画像処理のみで行うため、モデルは不要です。
+上記モデルが使われるのは男性器・女性器・乳首の検出・輪郭化・追跡だけで、
+初回実行時に Hugging Face Hub からダウンロードされ、`~/.cache/huggingface/` にキャッシュされます。
 **HF アカウントやログインは不要**です。
 
 検出は booru 系大規模アノテーションで学習されたアニメ絵専用 YOLOv8 で、
@@ -61,8 +64,10 @@ Python と Tkinter で作られた画像/動画モザイク編集ツールです
 
 | 環境 | 目安 |
 |------|------|
-| NVIDIA GPU (VRAM 4GB+) | 快適 (検出は CPU でも数十ms) |
-| CPU only | 検出は高速。SAM2 の輪郭化・動画追跡は遅め |
+| NVIDIA GPU (VRAM 4GB+) | 快適 (SAM2 の輪郭化・動画追跡も高速) |
+| CPU only | 編集と既存モザイク検出はそのまま快適に動作。局部の SAM2 輪郭化・動画追跡は遅め |
+
+GPU/SAM2 が無くても、手動編集と `モザイク` カテゴリの検出は基本依存だけで動きます。
 
 ## インストールと実行
 
@@ -87,6 +92,13 @@ python -m venv venv
 # Windows: venv\Scripts\activate / Mac・Linux: source venv/bin/activate
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128  # GPU 環境
 pip install -r requirements.txt
+python mosaic.py
+```
+
+手動編集と `モザイク` 検出だけ使うなら、重い依存を入れなくても動きます:
+
+```bash
+pip install Pillow numpy opencv-python tkinterdnd2
 python mosaic.py
 ```
 
