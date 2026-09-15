@@ -28,8 +28,7 @@ class Sam2VideoTracker:
 
     SAM2_MODEL_ID = "facebook/sam2.1-hiera-large"
 
-    def __init__(self, detect_fn: DetectFn):
-        self.detect_fn = detect_fn
+    def __init__(self):
         self._loaded = False
         self.device: Optional[str] = None
         self.dtype = None
@@ -58,6 +57,7 @@ class Sam2VideoTracker:
         self,
         video_path: str,
         categories: List[Category],
+        detect_fn: DetectFn,
         progress_cb: ProgressCB = None,
         cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Dict[int, np.ndarray]:
@@ -95,7 +95,7 @@ class Sam2VideoTracker:
             if progress_cb:
                 progress_cb(f"フレーム {frame_base + 1}: 対象を検出中...")
             first_img = Image.fromarray(frames[0])
-            detections = self.detect_fn(first_img, categories)
+            detections = detect_fn(first_img, categories)
 
             if not detections:
                 # このチャンクに対象なし → 次のチャンクへ

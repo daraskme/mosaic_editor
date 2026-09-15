@@ -26,6 +26,14 @@ def safe_grab(win: tk.Toplevel) -> None:
     _try()
 
 
+def close_window(win: tk.Toplevel) -> None:
+    """破棄済みでもエラーにならないようにウィンドウを閉じる."""
+    try:
+        win.destroy()
+    except tk.TclError:
+        pass
+
+
 def show_progress_window(root, title: str, msg: str,
                          with_progress_bar: bool = False,
                          maximum: int = 100,

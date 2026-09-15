@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from ..core.categories import Category
+from ..core.categories import MOSAIC_KEY, Category
 from .base import Detection, ProgressCB
 
 
@@ -19,7 +19,7 @@ class MosaicDetector:
         threshold: float = 0.3,
         progress_cb: ProgressCB = None,
     ) -> List[Detection]:
-        category = next((c for c in categories if c.key == "mosaic"), None)
+        category = next((c for c in categories if c.key == MOSAIC_KEY), None)
         if category is None:
             return []
         if progress_cb:

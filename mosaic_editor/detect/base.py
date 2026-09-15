@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
-from PIL import Image
 
 ProgressCB = Optional[Callable[[str], None]]
 
@@ -40,13 +39,6 @@ def pick_dtype(device: str):
     if device == "mps":
         return torch.float16
     return torch.float32
-
-
-def mask_to_bbox(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
-    ys, xs = np.nonzero(mask)
-    if len(xs) == 0:
-        return None
-    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
 
 
 def dedup_detections(detections: List[Detection], iou_thresh: float = 0.65) -> List[Detection]:

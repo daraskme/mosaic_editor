@@ -12,7 +12,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 from PIL import Image
 
-from ..core.categories import Category
+from ..core.categories import MOSAIC_KEY, Category, split_categories
 from ..core.masking import dilate_mask
 from .base import Detection, ProgressCB, dedup_detections
 
@@ -59,8 +59,8 @@ class DetectionPipeline:
         use_refiner: bool = True,
         progress_cb: ProgressCB = None,
     ) -> List[Detection]:
-        anime_categories = [c for c in categories if c.key != "mosaic"]
-        boxes = []
+        anime_categories, mosaic_categories = split_categories(categories)
+        boxes: List[Detection] = []
         if anime_categories:
             boxes = self.anime.detect(
                 image, anime_categories, threshold=threshold,
@@ -76,8 +76,11 @@ class DetectionPipeline:
                     print(f"[refine] failed for {det.bbox}: {e}")
                     det.mask = None
 
-        mosaics = self.mosaic.detect(
-            image, categories, threshold=threshold, progress_cb=progress_cb)
+        mosaics: List[Detection] = []
+        if mosaic_categories:
+            mosaics = self.mosaic.detect(
+                image, mosaic_categories, threshold=threshold,
+                progress_cb=progress_cb)
         return dedup_detections(boxes + mosaics)
 
     # ---- 動画トラッキング ----
@@ -90,20 +93,21 @@ class DetectionPipeline:
         progress_cb: ProgressCB = None,
         cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Dict[int, np.ndarray]:
-        anime_categories = [c for c in categories if c.key != "mosaic"]
+        anime_categories, mosaic_categories = split_categories(categories)
         masks: Dict[int, np.ndarray] = {}
         if anime_categories:
             if self._video_tracker is None:
                 from .sam2_video import Sam2VideoTracker
-                self._video_tracker = Sam2VideoTracker(lambda img, cats: [])
-            self._video_tracker.detect_fn = lambda img, cats: self.anime.detect(
-                img, cats, threshold=threshold)
+                self._video_tracker = Sam2VideoTracker()
             masks = self._video_tracker.track_video(
                 video_path, anime_categories,
+                detect_fn=lambda img, cats: self.anime.detect(
+                    img, cats, threshold=threshold),
                 progress_cb=progress_cb, cancel_check=cancel_check)
-        if any(c.key == "mosaic" for c in categories):
+        if mosaic_categories:
             mosaic_masks = self._detect_video_mosaics(
-                video_path, categories, threshold, progress_cb, cancel_check)
+                video_path, mosaic_categories, threshold, progress_cb,
+                cancel_check)
             for frame_idx, mask in mosaic_masks.items():
                 existing = masks.get(frame_idx)
                 masks[frame_idx] = np.maximum(existing, mask) \
@@ -149,7 +153,8 @@ class DetectionPipeline:
 
     @staticmethod
     def required_packages(categories: List[Category]) -> Tuple[str, ...]:
-        if any(c.key != "mosaic" for c in categories):
+        """選択カテゴリの検出に必要な追加パッケージ (モザイクのみなら不要)."""
+        if any(c.key != MOSAIC_KEY for c in categories):
             return "torch", "transformers", "imgutils"
         return ()
 

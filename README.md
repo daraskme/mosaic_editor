@@ -114,3 +114,13 @@ python mosaic.py
 - 各検出器の結果はバックエンド非依存の `Detection` 型に正規化され、
   `DetectionPipeline.combine_masks()` で1枚のマスクに統合されます
 - SAM2 Video は bf16 だと長尺伝播で数値的に不安定なため fp32 固定です
+- 既存モザイク検出は Pillow / numpy / OpenCV だけで動くため、`モザイク`
+  のみを選んだ場合は自動検出の追加依存 (torch 等) を要求しません
+
+## テスト
+
+既存モザイク検出とカテゴリ振り分けのテストは追加依存なしで実行できます。
+
+```bash
+python -m unittest discover -s tests -t .
+```
