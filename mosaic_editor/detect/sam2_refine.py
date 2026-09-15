@@ -5,12 +5,19 @@ facebook/sam2.1-hiera-* は非gated・Apache-2.0 で、HF ログイン不要。
 """
 from __future__ import annotations
 
-from typing import Optional, Tuple
+import gc
+import logging
+from typing import List, Optional, Tuple
 
 import numpy as np
+import torch
+import transformers
 from PIL import Image
+from transformers import Sam2Model, Sam2Processor
 
 from .base import ProgressCB, pick_device, pick_dtype
+
+logger = logging.getLogger(__name__)
 
 
 class Sam2BoxRefiner:
@@ -20,15 +27,12 @@ class Sam2BoxRefiner:
         self._loaded = False
         self.device: Optional[str] = None
         self.dtype = None
-        self.model = None
-        self.processor = None
+        self.model: Optional[Sam2Model] = None
+        self.processor: Optional[Sam2Processor] = None
 
     def load(self, progress_cb: ProgressCB = None):
         if self._loaded:
             return
-        import transformers
-        from transformers import Sam2Model, Sam2Processor
-
         self.device = pick_device()
         self.dtype = pick_dtype(self.device)
         if progress_cb:
@@ -53,38 +57,62 @@ class Sam2BoxRefiner:
         box: Tuple[int, int, int, int],
     ) -> Optional[np.ndarray]:
         """bbox 内の物体の輪郭マスク (uint8 H×W, 0/255) を返す."""
-        import torch
+        return self.segment_boxes(image, [box])[0]
 
-        self.load()
+    def segment_boxes(
+        self,
+        image: Image.Image,
+        boxes: List[Tuple[int, int, int, int]],
+        progress_cb: ProgressCB = None,
+    ) -> List[Optional[np.ndarray]]:
+        """画像特徴を1回だけ計算し、各 bbox を順に輪郭マスク化する."""
+        if not boxes:
+            return []
+        self.load(progress_cb)
+        model, processor = self.model, self.processor
+        if model is None or processor is None:
+            raise RuntimeError("SAM2 のロードが完了していません")
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        x1, y1, x2, y2 = box
-        inputs = self.processor(
+        inputs = processor(
             images=image,
-            input_boxes=[[[float(x1), float(y1), float(x2), float(y2)]]],
+            input_boxes=[[list(map(float, box)) for box in boxes]],
             return_tensors="pt",
         ).to(self.device, dtype=self.dtype)
-        with torch.no_grad():
-            outputs = self.model(**inputs, multimask_output=True)
-
-        masks = self.processor.post_process_masks(
-            outputs.pred_masks.float().cpu(), inputs["original_sizes"]
-        )[0]
-        # masks: (num_boxes=1, num_multimask, H, W) — IoU 最良のマスクを採用
-        iou = outputs.iou_scores.float().cpu()[0, 0]
-        best = int(iou.argmax())
-        mask = masks[0, best].numpy().astype(bool)
-        return mask.astype(np.uint8) * 255
+        masks: List[Optional[np.ndarray]] = []
+        with torch.inference_mode():
+            if progress_cb:
+                progress_cb("SAM2 の画像特徴を計算中...")
+            embeddings = model.get_image_embeddings(inputs["pixel_values"])
+            for i, box in enumerate(boxes):
+                if progress_cb:
+                    progress_cb(f"SAM2 で輪郭マスク化 [{i + 1}/{len(boxes)}]...")
+                try:
+                    outputs = model(
+                        image_embeddings=embeddings,
+                        input_boxes=inputs["input_boxes"][:, i:i + 1],
+                        multimask_output=True,
+                    )
+                    best = int(outputs.iou_scores[0, 0].argmax())
+                    mask = processor.post_process_masks(
+                        outputs.pred_masks[:, :, best:best + 1].float().cpu(),
+                        inputs["original_sizes"],
+                    )[0][0, 0]
+                    masks.append(mask.numpy().astype(np.uint8) * 255)
+                except Exception as exc:
+                    logger.warning("SAM2 refinement failed for %s: %s", box, exc)
+                    if progress_cb:
+                        progress_cb(f"SAM2 輪郭化に失敗、矩形を使用: {exc}")
+                    masks.append(None)
+        return masks
 
     def unload(self):
-        import gc
         self.model = None
         self.processor = None
         self._loaded = False
         gc.collect()
         try:
-            import torch
             torch.cuda.empty_cache()
         except Exception:
             pass

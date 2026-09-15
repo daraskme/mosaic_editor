@@ -51,7 +51,8 @@ class AnimeCensorDetector:
             return []
 
         if progress_cb:
-            progress_cb("AnimeCensor (YOLOv8) 検出中...")
+            progress_cb("AnimeCensor (YOLOv8) 検出中...\n"
+                        "初回はモデルをダウンロードします (~50MB)")
 
         results = detect_censors(image, level=self.level,
                                  conf_threshold=threshold)
