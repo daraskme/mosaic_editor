@@ -1,7 +1,6 @@
 """検出カテゴリ定義.
 
-検出器は deepghs/anime_censor_detection (YOLOv8)。
-モデルが検出できるのは 男性器 / 女性器 / 乳首 の3クラス。
+男性器 / 女性器 / 乳首は AnimeCensor、既存のモザイクはブロック格子で検出。
 """
 from __future__ import annotations
 
@@ -33,5 +32,11 @@ DEFAULT_CATEGORIES: List[Category] = [
         label="乳首",
         enabled_default=False,
         note="通常モザイク不要のためデフォルトOFF",
+    ),
+    Category(
+        key="mosaic",
+        label="モザイク",
+        enabled_default=False,
+        note="既存のブロックモザイクを検出（ドット絵等の誤検出に注意）",
     ),
 ]

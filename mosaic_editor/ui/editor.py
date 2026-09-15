@@ -911,7 +911,9 @@ class MosaicEditor:
                 self.push_history()
                 self._run_detect_current(cfg)
 
-        ensure_deps(self.root, _go)
+        ensure_deps(
+            self.root, _go,
+            packages=self.pipeline.required_packages(cfg.categories))
 
     def _run_detect_current(self, cfg: DetectConfig):
         win, status, _ = show_progress_window(
@@ -1031,7 +1033,9 @@ class MosaicEditor:
         if not cfg.categories:
             messagebox.showwarning("自動検出", "検出対象を1つ以上選んでください")
             return
-        ensure_deps(self.root, lambda: self._run_folder_batch(img_files, cfg))
+        ensure_deps(
+            self.root, lambda: self._run_folder_batch(img_files, cfg),
+            packages=self.pipeline.required_packages(cfg.categories))
 
     def _run_folder_batch(self, img_files: List[str], cfg: DetectConfig):
         total = len(img_files)
