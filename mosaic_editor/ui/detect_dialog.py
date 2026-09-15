@@ -111,9 +111,10 @@ class DetectConfigDialog:
                            variable=overwrite_var).pack(pady=(4, 0))
 
         tk.Label(win,
-                 text=("検出: deepghs/anime_censor_detection (イラスト向けYOLOv8) / "
+                 text=("検出: モザイク格子 + AnimeCensor (イラスト向けYOLOv8) / "
                        "輪郭化・動画追跡: SAM2.1\n"
-                       "初回はモデルのダウンロードが発生します (~1GB)。"),
+                       "男性器・女性器・乳首の初回検出時のみモデルの"
+                       "ダウンロード (~1GB) が発生します。"),
                  font=("", 8), fg="#888888", justify="left", wraplength=520
                  ).pack(pady=(8, 0), padx=10, anchor="w")
 

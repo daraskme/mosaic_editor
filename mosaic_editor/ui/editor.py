@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
 from typing import Dict, List, Optional
 
 import cv2
@@ -19,11 +19,10 @@ from PIL import Image, ImageTk
 
 from ..core import masking
 from ..core.categories import DEFAULT_CATEGORIES, Category
-from ..core.session import (ALL_SUPPORTED_EXT, SUPPORTED_EXT,
-                            SUPPORTED_VIDEO_EXT, Session)
+from ..core.session import SUPPORTED_EXT, SUPPORTED_VIDEO_EXT, Session
 from ..detect.pipeline import DetectionPipeline
 from .detect_dialog import DetectConfig, DetectConfigDialog, show_detection_results
-from .progress import ensure_deps, safe_grab, show_progress_window
+from .progress import close_window, ensure_deps, safe_grab, show_progress_window
 
 
 class MosaicEditor:
@@ -911,7 +910,9 @@ class MosaicEditor:
                 self.push_history()
                 self._run_detect_current(cfg)
 
-        ensure_deps(self.root, _go)
+        ensure_deps(
+            self.root, _go,
+            packages=self.pipeline.required_packages(cfg.categories))
 
     def _run_detect_current(self, cfg: DetectConfig):
         win, status, _ = show_progress_window(
@@ -934,10 +935,7 @@ class MosaicEditor:
         threading.Thread(target=worker, daemon=True).start()
 
     def _review_detections(self, win, cfg: DetectConfig, detections):
-        try:
-            win.destroy()
-        except Exception:
-            pass
+        close_window(win)
         if self.mosaic_mask is None:
             return
         if not detections:
@@ -963,10 +961,7 @@ class MosaicEditor:
             "ペン・魔法の杖・消しゴムで微調整してから保存してください。")
 
     def _on_detect_error(self, win, err: str):
-        try:
-            win.destroy()
-        except Exception:
-            pass
+        close_window(win)
         messagebox.showerror("検出エラー", f"検出中にエラーが発生しました:\n{err}")
 
     # ---- 動画全体: SAM2 トラッキング ----
@@ -1003,10 +998,7 @@ class MosaicEditor:
         threading.Thread(target=worker, daemon=True).start()
 
     def _finish_video_tracking(self, win, masks: Dict[int, np.ndarray]):
-        try:
-            win.destroy()
-        except Exception:
-            pass
+        close_window(win)
         for fi, m in masks.items():
             existing = self.video_masks.get(fi)
             self.video_masks[fi] = masking.merge_masks(existing, m)
@@ -1031,7 +1023,9 @@ class MosaicEditor:
         if not cfg.categories:
             messagebox.showwarning("自動検出", "検出対象を1つ以上選んでください")
             return
-        ensure_deps(self.root, lambda: self._run_folder_batch(img_files, cfg))
+        ensure_deps(
+            self.root, lambda: self._run_folder_batch(img_files, cfg),
+            packages=self.pipeline.required_packages(cfg.categories))
 
     def _run_folder_batch(self, img_files: List[str], cfg: DetectConfig):
         total = len(img_files)
@@ -1084,10 +1078,7 @@ class MosaicEditor:
         threading.Thread(target=worker, daemon=True).start()
 
     def _finish_folder_batch(self, win, applied: int, total: int):
-        try:
-            win.destroy()
-        except Exception:
-            pass
+        close_window(win)
         self.load_current_file()
         if self._detect_cancel:
             messagebox.showinfo("キャンセル", f"{applied}/{total} 枚適用済みでキャンセルしました")
